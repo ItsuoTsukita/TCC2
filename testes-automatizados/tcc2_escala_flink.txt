@@ -1,0 +1,628 @@
+Executa o teste final de escala do Flink com um e dois TaskManagers em EC2 distintas.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+REGIAO=us-east-1
+BUCKET=tcc2-pacotes-CONTA_AWS-us-east-1
+CONTA=CONTA_AWS
+P1=i-EXEMPLO
+P2=i-EXEMPLO
+REMOTO=i-EXEMPLO
+MOTOR=i-EXEMPLO
+IP_MOTOR=IP_EXEMPLO
+IP_REMOTO=IP_EXEMPLO
+IDS=("$P1" "$P2" "$REMOTO" "$MOTOR")
+RUN="$(date -u +%Y%m%d_%H%M%S)"
+PREFIXO="resultados/escalabilidade/flink/$RUN"
+LIGOU=0
+INCIDENTES=0
+LIMITE=$(( $(date +%s) + 2700 ))
+log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+finalizar() {
+  local codigo=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    log 'Desligando exclusivamente as quatro EC2 usadas nesta escala.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null || codigo=1
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+      log 'Quatro EC2 confirmadas desligadas.'
+    else
+      log 'ATENCAO: verificar estado das quatro EC2 no console.'
+      codigo=1
+    fi
+    log "Evidencias: s3://$BUCKET/$PREFIXO/"
+  fi
+  log "Codigo final: $codigo; incidentes: $INCIDENTES"
+  exit "$codigo"
+}
+trap finalizar EXIT INT TERM
+
+modo="${1:---check}"
+[[ "$modo" = --check || "$modo" = --run ]] || {
+  log 'Uso: bash tcc2_escala_flink_corrigido_20261106_v3.sh --check | --run'; exit 2;
+}
+for exe in aws jq; do command -v "$exe" >/dev/null || { log "Falta $exe"; exit 1; }; done
+[[ "$(aws sts get-caller-identity --query Account --output text)" = "$CONTA" ]] || {
+  log 'Conta AWS inesperada'; exit 1;
+}
+dados=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "${IDS[@]}" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,VpcId,IamInstanceProfile.Arn]' --output json)
+[[ "$(jq length <<<"$dados")" = 4 ]] || { log 'Quatro EC2 nao localizadas'; exit 1; }
+for id in "${IDS[@]}"; do
+  item=$(jq -c --arg id "$id" '.[] | select(.[0]==$id)' <<<"$dados")
+  [[ -n "$item" ]] || { log "Instancia desconhecida: $id"; exit 1; }
+  estado=$(jq -r '.[1]' <<<"$item")
+  tipo=$(jq -r '.[2]' <<<"$item")
+  vpc=$(jq -r '.[3]' <<<"$item")
+  iam=$(jq -r '.[4]' <<<"$item")
+  log "$id: $estado | $tipo | $vpc | $iam"
+  [[ "$estado" = stopped && "$tipo" = c7a.2xlarge && "$vpc" = vpc-EXEMPLO \
+     && "$iam" = */TCC2-EC2-Kinesis ]] || { log 'Inventario divergente; abortado sem ligar EC2.'; exit 1; }
+  pendentes=$(aws ssm list-command-invocations --region "$REGIAO" --instance-id "$id" \
+    --query "CommandInvocations[?Status=='Pending'||Status=='InProgress'||Status=='Delayed'].CommandId" --output text)
+  [[ -z "$pendentes" ]] || { log "SSM pendente em $id: $pendentes"; exit 1; }
+done
+aws s3api head-bucket --bucket "$BUCKET" >/dev/null
+
+associacoes=$(aws ec2 describe-instances --region "$REGIAO" \
+  --instance-ids "${IDS[@]}" --output json)
+mapfile -t grupos_reais < <(jq -r '.Reservations[].Instances[].SecurityGroups[].GroupId' \
+  <<<"$associacoes" | sort -u)
+(( ${#grupos_reais[@]} > 0 )) || { log 'Nenhum grupo de seguranca encontrado.'; exit 1; }
+regras=$(aws ec2 describe-security-groups --region "$REGIAO" \
+  --group-ids "${grupos_reais[@]}" --output json)
+if ! python3 - "$associacoes" "$regras" "$MOTOR" "$REMOTO" "$P1" "$P2" <<'PY'
+import ipaddress,json,sys
+inst=json.loads(sys.argv[1]); grupos=json.loads(sys.argv[2]); motor,remoto,p1,p2=sys.argv[3:]
+maquinas={i['InstanceId']:i for r in inst['Reservations'] for i in r['Instances']}
+regras_por_grupo={g['GroupId']:g for g in grupos['SecurityGroups']}
+def liberado(origem,destino,porta):
+    a,b=maquinas[origem],maquinas[destino]
+    ip=ipaddress.ip_address(a['PrivateIpAddress'])
+    origens={g['GroupId'] for g in a['SecurityGroups']}
+    for sg in b['SecurityGroups']:
+        for regra in regras_por_grupo[sg['GroupId']].get('IpPermissions',[]):
+            proto=str(regra.get('IpProtocol',''))
+            if not (proto=='-1' or proto=='tcp' and
+                    regra.get('FromPort',0)<=porta<=regra.get('ToPort',0)):
+                continue
+            if any(g.get('GroupId') in origens for g in regra.get('UserIdGroupPairs',[])):
+                return True
+            for faixa in regra.get('IpRanges',[]):
+                if ip in ipaddress.ip_network(faixa['CidrIp'],strict=False):
+                    return True
+    return False
+def saida_liberada(origem,destino,porta):
+    a,b=maquinas[origem],maquinas[destino]
+    ip=ipaddress.ip_address(b['PrivateIpAddress'])
+    destino_grupos={g['GroupId'] for g in b['SecurityGroups']}
+    for sg in a['SecurityGroups']:
+        for regra in regras_por_grupo[sg['GroupId']].get('IpPermissionsEgress',[]):
+            proto=str(regra.get('IpProtocol',''))
+            if not (proto=='-1' or proto=='tcp' and
+                    regra.get('FromPort',0)<=porta<=regra.get('ToPort',0)):
+                continue
+            if any(g.get('GroupId') in destino_grupos for g in regra.get('UserIdGroupPairs',[])):
+                return True
+            for faixa in regra.get('IpRanges',[]):
+                if ip in ipaddress.ip_network(faixa['CidrIp'],strict=False):
+                    return True
+    return False
+requisitos=[(remoto,motor,[6123,6124,9092,5432]),
+            (motor,remoto,[6122,6125]),
+            (p1,motor,[9092]),(p2,motor,[9092])]
+faltas=[]
+for origem,destino,portas in requisitos:
+    for porta in portas:
+        if not liberado(origem,destino,porta):
+            faltas.append((origem,destino,porta,'entrada'))
+        if not saida_liberada(origem,destino,porta):
+            faltas.append((origem,destino,porta,'saida'))
+print('SECURITY_GROUPS_REAIS:',{i: [g['GroupId'] for g in m['SecurityGroups']]
+                               for i,m in maquinas.items()})
+if faltas:
+    for a,b,p,tipo in faltas: print('PORTA_INTERNA_NAO_CONFIRMADA:',a,'->',b,p,tipo)
+    print('ABORTADO_SEM_LIGAR_EC2. Ajustar regras de entrada ou verificar topologia.')
+    sys.exit(1)
+print('REGRAS_INTERNAS_CONFIRMADAS: RPC, blob, Kafka, PostgreSQL e troca de dados.')
+PY
+then
+  log 'A comunicacao interna exigida pelo Flink nao foi comprovada. Nenhuma EC2 foi ligada.'
+  exit 1
+fi
+log 'Inventario e regras de comunicacao interna validados sem custos EC2.'
+if [[ "$modo" = --check ]]; then
+  log 'CHECK OK; nenhuma instancia iniciada. --run exige autorizacao.'
+  exit 0
+fi
+log 'ATENCAO: --run inicia QUATRO EC2 c7a.2xlarge por ate 45 minutos, alem de custos aplicaveis.'
+log 'Teste planejado: duas cargas isoladas de 100.000 eventos, 1 e 2 TaskManagers em nos fisicos distintos.'
+read -r -p 'Para autorizar os custos, digite SIM: ' confirmar
+[[ "$confirmar" = SIM ]] || { log 'Cancelado; nenhuma EC2 iniciada.'; exit 0; }
+
+enviar() {
+  local id="$1" script="$2" parametros
+  parametros=$(jq -cn --arg s "$script" '{commands:[$s],executionTimeout:["1500"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript \
+    --instance-ids "$id" --parameters "$parametros" --query Command.CommandId --output text
+}
+aguardar() {
+  local id="$1" cmd="$2" status=''
+  for _ in $(seq 1 300); do
+    (( $(date +%s) < LIMITE )) || { log 'Limite de execucao de 45 minutos'; return 1; }
+    status=$(aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+      --command-id "$cmd" --query Status --output text 2>/dev/null || true)
+    case "$status" in
+      Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable|Terminated) break ;;
+    esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" --command-id "$cmd" \
+    --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json || true
+  [[ "$status" = Success ]]
+}
+rodar() { local cmd; cmd=$(enviar "$1" "$2"); aguardar "$1" "$cmd"; }
+trocar() { printf '%s' "${1//__$2__/$3}"; }
+
+LIGOU=1
+log 'Iniciando EC2-01, EC2-02, EC2-04 e EC2-05. EC2-03 permanecera desligada.'
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+online=0
+for _ in $(seq 1 50); do
+  lista=" $(aws ssm describe-instance-information --region "$REGIAO" \
+    --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' --output text | tr '\t' ' ') "
+  online=1
+  for id in "${IDS[@]}"; do [[ "$lista" == *" $id "* ]] || online=0; done
+  (( online )) && break
+  sleep 10
+done
+(( online )) || { log 'SSM offline em alguma EC2'; exit 1; }
+for id in "${IDS[@]}"; do
+  rodar "$id" $'#!/bin/bash\nset -e\nshutdown -h +45\necho PARADA_DE_SEGURANCA_45_MIN' || exit 1
+done
+
+INICIAR_MOTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+IP=IP_EXEMPLO
+BASE="/tmp/tcc2-escala-flink-$RUN"
+DIR=/opt/tcc2/complementos/AWS/Preparacao
+mkdir -p "$BASE"
+cd "$DIR"
+test -s .env
+for arq in flink-sql-connector-kafka-3.4.0-1.20.jar flink-connector-jdbc-3.4.0-1.20.jar postgresql-42.7.4.jar; do
+  test -s "Flink/connectors/$arq"
+done
+docker stop materialize-tcc risingwave-tcc arroyo-tcc flink-jobmanager-tcc flink-taskmanager-tcc >/dev/null 2>&1 || true
+docker compose --env-file .env -f docker-compose-flink-kafka.yml up -d kafka postgres
+for _ in $(seq 1 80); do
+  docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1 && \
+  docker exec postgres-resultados-tcc pg_isready -U tcc -d tcc >/dev/null 2>&1 && break
+  sleep 3
+done
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null
+docker exec postgres-resultados-tcc pg_isready -U tcc -d tcc >/dev/null
+PROPS="jobmanager.rpc.address: $IP
+jobmanager.bind-host: 0.0.0.0
+jobmanager.rpc.port: 6123
+rest.address: $IP
+rest.bind-address: 0.0.0.0
+rest.port: 8081
+blob.server.port: 6124"
+JARS=()
+for arq in flink-sql-connector-kafka-3.4.0-1.20.jar flink-connector-jdbc-3.4.0-1.20.jar postgresql-42.7.4.jar; do
+  JARS+=(-v "$DIR/Flink/connectors/$arq:/opt/flink/lib/$arq:ro")
+done
+docker run -d --name "tcc2-escala-jm-$RUN" --network host \
+  -e "FLINK_PROPERTIES=$PROPS" "${JARS[@]}" flink:1.20 jobmanager >/dev/null
+for _ in $(seq 1 50); do
+  if curl -fsS http://127.0.0.1:8081/overview >/dev/null 2>&1; then break; fi
+  sleep 3
+done
+curl -fsS http://127.0.0.1:8081/overview >/dev/null
+echo "JOBMANAGER_NA_EC2_05_ONLINE"
+REMOTO
+)
+
+INICIAR_TM=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+NO=__NO__
+IP=__IP__
+DIR=/opt/tcc2/complementos/AWS/Preparacao
+docker image inspect flink:1.20 >/dev/null 2>&1 || docker pull flink:1.20 >/dev/null
+PROPS="jobmanager.rpc.address: IP_EXEMPLO
+jobmanager.rpc.port: 6123
+taskmanager.host: $IP
+taskmanager.bind-host: 0.0.0.0
+taskmanager.rpc.port: 6122
+taskmanager.data.port: 6125
+taskmanager.numberOfTaskSlots: 4"
+JARS=()
+for arq in flink-sql-connector-kafka-3.4.0-1.20.jar flink-connector-jdbc-3.4.0-1.20.jar postgresql-42.7.4.jar; do
+  test -s "$DIR/Flink/connectors/$arq"
+  JARS+=(-v "$DIR/Flink/connectors/$arq:/opt/flink/lib/$arq:ro")
+done
+docker run -d --name "tcc2-escala-tm-$NO-$RUN" --network host \
+  -e "FLINK_PROPERTIES=$PROPS" "${JARS[@]}" flink:1.20 taskmanager >/dev/null
+BASE="/tmp/tcc2-escala-flink-$RUN-monitor-$NO"
+mkdir -p "$BASE"
+printf 'utc,load_1m,mem_total_kb,mem_available_kb,cpu_docker,ram_docker\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+ while test -f "$1/monitorar"; do
+  load=$(cut -d" " -f1 /proc/loadavg)
+  total=$(awk "/MemTotal:/{print \$2}" /proc/meminfo)
+  livre=$(awk "/MemAvailable:/{print \$2}" /proc/meminfo)
+  stats=$(docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "$2" 2>/dev/null | head -1 || true)
+  cpu=${stats%%|*}
+  ram=${stats#*|}
+  printf "%s,%s,%s,%s,\"%s\",\"%s\"\n" "$(date -u +%FT%TZ)" "$load" "$total" "$livre" "$cpu" "$ram" >> "$1/metricas.csv"
+  sleep 3
+ done
+' bash "$BASE" "tcc2-escala-tm-$NO-$RUN" >/dev/null 2>&1 </dev/null &
+echo "TASKMANAGER_INICIADO_NO=$NO IP=$IP"
+REMOTO
+)
+
+PREPARAR_FASE=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+FASE=__FASE__
+PARALELISMO=__PARALELISMO__
+BASE="/tmp/tcc2-escala-flink-$RUN/$FASE"
+mkdir -p "$BASE"
+export RUN FASE BASE
+salvar_diagnostico_erro() {
+  local rc=$?
+  if (( rc != 0 )); then
+    /opt/tcc2/venv/bin/python - <<'PY' || true
+import boto3,os
+from pathlib import Path
+base=Path(os.environ['BASE'])
+prefix=f"resultados/escalabilidade/flink/{os.environ['RUN']}/{os.environ['FASE']}/diagnostico/"
+s3=boto3.client('s3',region_name='us-east-1')
+for name in ('flink_sql.log','jobs_antes.json','distribuicao_subtarefas.json'):
+    arquivo=base/name
+    if arquivo.is_file():
+        s3.upload_file(str(arquivo),'tcc2-pacotes-CONTA_AWS-us-east-1',
+                       prefix+name,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('DIAGNOSTICO_DE_FALHA_SALVO_NO_S3:',prefix,flush=True)
+PY
+  fi
+}
+trap salvar_diagnostico_erro EXIT
+TOPICO="tcc2-escala-flink-$RUN-$FASE"
+TABELA="eventos_escala_${RUN}_${FASE}"
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+  --create --if-not-exists --topic "$TOPICO" --partitions 8 --replication-factor 1
+docker exec postgres-resultados-tcc psql -U tcc -d tcc -v ON_ERROR_STOP=1 \
+  -c "CREATE TABLE $TABELA (id_evento BIGINT PRIMARY KEY, veiculo_id BIGINT, latitude DOUBLE PRECISION, longitude DOUBLE PRECISION, velocidade DOUBLE PRECISION, temperatura_carga DOUBLE PRECISION, status_rota TEXT, data_hora TEXT);"
+export RUN FASE BASE TOPICO TABELA PARALELISMO
+/opt/tcc2/venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+arq=Path(os.environ['BASE'])/'pipeline.sql'
+senha=next(x.split('=',1)[1].strip().strip('"') for x in Path('/opt/tcc2/complementos/AWS/Preparacao/.env').read_text().splitlines() if x.startswith('TCC_PG_PASSWORD='))
+assert senha and "'" not in senha
+sql="""
+SET 'parallelism.default' = '__PARALELISMO__';
+CREATE TABLE origem_escala (
+ id_evento BIGINT, veiculo_id BIGINT, latitude DOUBLE, longitude DOUBLE,
+ velocidade DOUBLE, temperatura_carga DOUBLE, status_rota STRING, data_hora STRING
+) WITH (
+ 'connector'='kafka', 'topic'='__TOPICO__',
+ 'properties.bootstrap.servers'='IP_EXEMPLO:9092',
+ 'properties.group.id'='tcc2-escala-__RUN__-__FASE__',
+ 'scan.startup.mode'='earliest-offset', 'format'='json'
+);
+CREATE TABLE destino_escala (
+ id_evento BIGINT, veiculo_id BIGINT, latitude DOUBLE, longitude DOUBLE,
+ velocidade DOUBLE, temperatura_carga DOUBLE, status_rota STRING, data_hora STRING,
+ PRIMARY KEY (id_evento) NOT ENFORCED
+) WITH (
+ 'connector'='jdbc', 'url'='jdbc:postgresql://IP_EXEMPLO:5432/tcc',
+ 'table-name'='__TABELA__', 'username'='tcc', 'password'='__SENHA__'
+);
+INSERT INTO destino_escala SELECT * FROM origem_escala;
+"""
+for chave,valor in {'PARALELISMO':os.environ['PARALELISMO'],'TOPICO':os.environ['TOPICO'],
+                   'RUN':os.environ['RUN'],'FASE':os.environ['FASE'],
+                   'TABELA':os.environ['TABELA'],'SENHA':senha}.items():
+    sql=sql.replace('__'+chave+'__',valor)
+assert '__' not in sql
+arq.write_text(sql)
+PY
+docker cp "$BASE/pipeline.sql" "tcc2-escala-jm-$RUN:/tmp/tcc2_escala.sql"
+timeout 180 docker exec "tcc2-escala-jm-$RUN" /opt/flink/bin/sql-client.sh \
+  -f /tmp/tcc2_escala.sql > "$BASE/flink_sql.log" 2>&1 || {
+    tail -n 80 "$BASE/flink_sql.log"; exit 1;
+  }
+for _ in $(seq 1 80); do
+  if curl -fsS http://127.0.0.1:8081/jobs/overview | \
+     python3 -c 'import json,sys; assert any(j["state"]=="RUNNING" for j in json.load(sys.stdin)["jobs"])' 2>/dev/null; then break; fi
+  sleep 3
+done
+curl -fsS http://127.0.0.1:8081/jobs/overview > "$BASE/jobs_antes.json"
+export BASE FASE
+/opt/tcc2/venv/bin/python - <<'PY'
+import json,os,time,urllib.request,urllib.error
+from pathlib import Path
+base=Path(os.environ['BASE'])
+def obter(caminho):
+    with urllib.request.urlopen('http://127.0.0.1:8081'+caminho,timeout=12) as resposta:
+        return json.load(resposta)
+ativos=[j for j in obter('/jobs/overview')['jobs'] if j['state']=='RUNNING']
+assert len(ativos)==1,('jobs ativos inesperados',ativos)
+id_job=ativos[0]['jid']
+vertices=obter('/jobs/'+id_job).get('vertices',[])
+assert vertices,'Sem vertices do job Flink'
+necessarios=2 if os.environ['FASE']=='dois_nos' else 1
+for tentativa in range(20):
+    hosts=set(); evidencias=[]
+    try:
+        for vertice in vertices:
+            item=obter(f'/jobs/{id_job}/vertices/{vertice["id"]}')
+            evidencias.append(item)
+            for sub in item.get('subtasks',[]):
+                if sub.get('host'): hosts.add(sub['host'])
+    except (urllib.error.HTTPError,urllib.error.URLError) as erro:
+        if tentativa==19: raise RuntimeError('REST Flink indisponivel apos 20 tentativas') from erro
+    if len(hosts)>=necessarios: break
+    time.sleep(3)
+resultado={'fase':os.environ['FASE'],'job_id':id_job,
+           'hosts_subtarefas':sorted(hosts),'vertices':evidencias}
+(base/'distribuicao_subtarefas.json').write_text(json.dumps(resultado,indent=2))
+print('HOSTS_DE_PROCESSAMENTO:',sorted(hosts),flush=True)
+assert len(hosts)>=necessarios, \
+    'TaskManagers registrados, mas trabalho nao distribuido; nao usar como evidencia de escala.'
+PY
+echo "PIPELINE_PREPARADA=$FASE topico=$TOPICO paralelismo=$PARALELISMO"
+REMOTO
+)
+
+PRODUZIR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+FASE=__FASE__
+NUM=__NUM__
+TOPICO="tcc2-escala-flink-$RUN-$FASE"
+BASE="/tmp/tcc2-escala-flink-$RUN-$FASE-produtor-$NUM"
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_100000.csv"
+mkdir -p "$BASE"
+test -s "$CSV"
+test "$(($(wc -l < "$CSV")-1))" = 50000
+export RUN FASE NUM BASE CSV TOPICO
+/opt/tcc2/venv/bin/python - <<'PY'
+import os,xml.etree.ElementTree as ET
+from pathlib import Path
+arquivo=Path('/opt/tcc2/clientes/JMeter/planos/Plano de TesteFlink_Kafka.jmx')
+arvore=ET.parse(arquivo); raiz=arvore.getroot(); alteradas=0
+for item in raiz.iter('JSR223Sampler'):
+    if item.get('enabled','true')=='false': continue
+    codigo=item.find("stringProp[@name='script']")
+    if codigo is not None and codigo.text and '"eventos-transporte"' in codigo.text:
+        codigo.text=codigo.text.replace('"eventos-transporte"','"'+os.environ['TOPICO']+'"')
+        alteradas+=1
+assert alteradas==1,alteradas
+for coletor in raiz.iter('ResultCollector'):
+    coletor.set('enabled','false')
+    caminho=coletor.find("stringProp[@name='filename']")
+    if caminho is not None: caminho.text=''
+arvore.write(Path(os.environ['BASE'])/'plano.jmx',encoding='utf-8',xml_declaration=True)
+PY
+set +e
+timeout 1000 /usr/local/bin/jmeter -n -t "$BASE/plano.jmx" -Jthreads=5 -Jloops=10000 \
+  -Jcsvfile="$CSV" -Jkafkaserver=IP_EXEMPLO:9092 \
+  -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+export RC
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,csv,json,os
+from pathlib import Path
+base=Path(os.environ['BASE']); linhas=erros=0
+if (base/'resultado.jtl').exists():
+    with (base/'resultado.jtl').open(encoding='utf-8',newline='') as arq:
+        for item in csv.DictReader(arq):
+            linhas+=1; erros+=item.get('success','').lower()!='true'
+info={'motor':'flink','fase':os.environ['FASE'],'ec2':os.environ['NUM'],
+      'esperado':50000,'amostras':linhas,'erros':erros,'jmeter_exit':int(os.environ['RC'])}
+(base/'resumo.json').write_text(json.dumps(info,indent=2))
+prefix=f"resultados/escalabilidade/flink/{os.environ['RUN']}/{os.environ['FASE']}/EC2-{os.environ['NUM']}/"
+s3=boto3.client('s3',region_name='us-east-1')
+for f in base.iterdir():
+    if f.is_file():
+        s3.upload_file(str(f),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+f.name,
+                       ExtraArgs={'ServerSideEncryption':'AES256'})
+print('JMETER:',info,flush=True)
+assert linhas==50000 and erros==0 and int(os.environ['RC'])==0,'JMeter incompleto; ver S3'
+PY
+REMOTO
+)
+
+VERIFICAR_TM=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+FASE=__FASE__
+ESPERADOS=__ESPERADOS__
+BASE="/tmp/tcc2-escala-flink-$RUN/$FASE"
+mkdir -p "$BASE"
+for _ in $(seq 1 70); do
+  curl -fsS http://127.0.0.1:8081/taskmanagers > "$BASE/taskmanagers.json" || true
+  if test -s "$BASE/taskmanagers.json" && \
+     python3 - "$BASE/taskmanagers.json" "$ESPERADOS" 2>/dev/null <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1]))
+assert len(x['taskmanagers'])==int(sys.argv[2])
+assert sum(t['slotsNumber'] for t in x['taskmanagers'])>=int(sys.argv[2])*4
+PY
+  then break; fi
+  sleep 4
+done
+python3 - "$BASE/taskmanagers.json" "$ESPERADOS" <<'PY'
+import json,sys
+x=json.load(open(sys.argv[1])); print('TASKMANAGERS:',len(x['taskmanagers']),x,flush=True)
+assert len(x['taskmanagers'])==int(sys.argv[2])
+PY
+REMOTO
+)
+
+AUDITAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+FASE=__FASE__
+ESPERADOS=__ESPERADOS__
+BASE="/tmp/tcc2-escala-flink-$RUN/$FASE"
+TABELA="eventos_escala_${RUN}_${FASE}"
+TOPICO="tcc2-escala-flink-$RUN-$FASE"
+INICIO_EPOCA=$(date +%s)
+FINAL=0
+for _ in $(seq 1 180); do
+  FINAL=$(docker exec postgres-resultados-tcc psql -U tcc -d tcc -t -A \
+    -c "SELECT COUNT(*) FROM $TABELA" | tail -1)
+  if [[ "$FINAL" = 100000 ]]; then break; fi
+  sleep 5
+done
+FINAL_EPOCA=$(date +%s)
+docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 \
+  --topic "$TOPICO" > "$BASE/offsets_kafka.txt"
+curl -fsS http://127.0.0.1:8081/taskmanagers > "$BASE/taskmanagers_depois.json"
+curl -fsS http://127.0.0.1:8081/jobs/overview > "$BASE/jobs_depois.json"
+export RUN FASE BASE FINAL ESPERADOS INICIO_EPOCA FINAL_EPOCA
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+base=Path(os.environ['BASE'])
+managers=json.loads((base/'taskmanagers_depois.json').read_text())['taskmanagers']
+jobs=json.loads((base/'jobs_depois.json').read_text())['jobs']
+offsets=(base/'offsets_kafka.txt').read_text().splitlines()
+disponiveis=sum(int(l.rsplit(':',1)[1]) for l in offsets if ':' in l)
+info={'motor':'flink','fase':os.environ['FASE'],'taskmanagers':len(managers),
+      'ids_taskmanagers':[x.get('id','') for x in managers],
+      'slots_total':sum(x.get('slotsNumber',0) for x in managers),
+      'esperados_eventos':100000,'offsets_kafka':disponiveis,
+      'registros_sink_postgres':int(os.environ['FINAL']),
+      'duracao_auditoria_segundos':int(os.environ['FINAL_EPOCA'])-int(os.environ['INICIO_EPOCA']),
+      'jobs':jobs,'observacao':'JMeter mede producao; tempo de auditoria mede espera pela saida apos JMeter.'}
+(base/'consistencia.json').write_text(json.dumps(info,ensure_ascii=False,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix=f"resultados/escalabilidade/flink/{os.environ['RUN']}/{os.environ['FASE']}/motor/"
+for f in base.iterdir():
+    if f.is_file() and f.name!='pipeline.sql':
+        s3.upload_file(str(f),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+f.name,
+                       ExtraArgs={'ServerSideEncryption':'AES256'})
+print('AUDITORIA_ESCALA:',info,flush=True)
+assert len(managers)==int(os.environ['ESPERADOS'])
+assert disponiveis==100000 and int(os.environ['FINAL'])==100000,'Entrada/saida divergentes; S3 preservado.'
+PY
+REMOTO
+)
+
+SALVAR_METRICAS=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+NO=__NO__
+BASE="/tmp/tcc2-escala-flink-$RUN-monitor-$NO"
+test -s "$BASE/metricas.csv"
+rm -f "$BASE/monitorar"
+sleep 3
+export RUN NO
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,os
+from pathlib import Path
+base=Path('/tmp/tcc2-escala-flink-'+os.environ['RUN']+'-monitor-'+os.environ['NO'])
+chave='resultados/escalabilidade/flink/'+os.environ['RUN']+'/monitoramento/'+os.environ['NO']+'/metricas.csv'
+boto3.client('s3',region_name='us-east-1').upload_file(
+    str(base/'metricas.csv'),'tcc2-pacotes-CONTA_AWS-us-east-1',chave,
+    ExtraArgs={'ServerSideEncryption':'AES256'})
+print('METRICAS_SALVAS:',chave,flush=True)
+PY
+REMOTO
+)
+
+log 'Preparando JobManager de escala independente na EC2-05.'
+rodar "$MOTOR" "$(trocar "$INICIAR_MOTOR" RUN "$RUN")" || exit 1
+log 'Registrando primeiro TaskManager na EC2-05.'
+script="$(trocar "$(trocar "$(trocar "$INICIAR_TM" RUN "$RUN")" NO local)" IP "$IP_MOTOR")"
+rodar "$MOTOR" "$script" || exit 1
+
+for fase in um_no dois_nos; do
+  numero=1
+  paralelismo=4
+  if [[ "$fase" = dois_nos ]]; then
+    numero=2
+    paralelismo=8
+    log 'Registrando TaskManager adicional na EC2-04.'
+    script="$(trocar "$(trocar "$(trocar "$INICIAR_TM" RUN "$RUN")" NO remoto)" IP "$IP_REMOTO")"
+    rodar "$REMOTO" "$script" || exit 1
+  fi
+  log "===== ESCALA FLINK: $fase; $numero TaskManager(s); $paralelismo slots ====="
+  script="$VERIFICAR_TM"
+  for par in "RUN=$RUN" "FASE=$fase" "ESPERADOS=$numero"; do
+    script="$(trocar "$script" "${par%%=*}" "${par#*=}")"
+  done
+  rodar "$MOTOR" "$script" || { log "Contagem TaskManager nao confere: $fase"; exit 1; }
+  script="$PREPARAR_FASE"
+  for par in "RUN=$RUN" "FASE=$fase" "PARALELISMO=$paralelismo"; do
+    script="$(trocar "$script" "${par%%=*}" "${par#*=}")"
+  done
+  rodar "$MOTOR" "$script" || { INCIDENTES=$((INCIDENTES+1)); log "Pipeline Flink nao iniciou: $fase"; exit 1; }
+  jobs=()
+  for num in 01 02; do
+    id="$P1"; [[ "$num" = 02 ]] && id="$P2"
+    script="$PRODUZIR"
+    for par in "RUN=$RUN" "FASE=$fase" "NUM=$num"; do
+      script="$(trocar "$script" "${par%%=*}" "${par#*=}")"
+    done
+    jobs+=("$id:$(enviar "$id" "$script")")
+  done
+  for job in "${jobs[@]}"; do
+    aguardar "${job%%:*}" "${job#*:}" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+  done
+  script="$AUDITAR"
+  for par in "RUN=$RUN" "FASE=$fase" "ESPERADOS=$numero"; do
+    script="$(trocar "$script" "${par%%=*}" "${par#*=}")"
+  done
+  rodar "$MOTOR" "$script" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+  log "Fase $fase concluida: Kafka=100000 e PostgreSQL=100000, segundo auditoria."
+  if [[ "$fase" = um_no ]]; then
+    CANCELAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+JOBS=$(curl -fsS http://127.0.0.1:8081/jobs/overview | python3 -c '
+import json,sys
+print(" ".join(j["jid"] for j in json.load(sys.stdin)["jobs"] if j["state"]=="RUNNING"))')
+for id in $JOBS; do
+  docker exec "tcc2-escala-jm-$RUN" /opt/flink/bin/flink cancel "$id"
+done
+for _ in $(seq 1 45); do
+  quantidade=$(curl -fsS http://127.0.0.1:8081/jobs/overview | python3 -c '
+import json,sys
+print(sum(j["state"]=="RUNNING" for j in json.load(sys.stdin)["jobs"]))')
+  [[ "$quantidade" = 0 ]] && break
+  sleep 3
+done
+[[ "$quantidade" = 0 ]]
+echo JOB_UM_NO_CANCELADO
+REMOTO
+)
+    rodar "$MOTOR" "$(trocar "$CANCELAR" RUN "$RUN")" || exit 1
+  fi
+done
+for no in local remoto; do
+  id="$MOTOR"; [[ "$no" = remoto ]] && id="$REMOTO"
+  script="$(trocar "$(trocar "$SALVAR_METRICAS" RUN "$RUN")" NO "$no")"
+  rodar "$id" "$script" || { INCIDENTES=$((INCIDENTES+1)); log "Falha enviando metricas $no"; exit 1; }
+done
+log 'ESCALABILIDADE FLINK CONCLUIDA. Comparar tempos completos e registros de TaskManagers no S3.'

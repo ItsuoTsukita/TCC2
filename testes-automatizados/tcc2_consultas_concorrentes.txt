@@ -1,0 +1,362 @@
+Executa consultas no Materialize e RisingWave enquanto os produtores enviam eventos.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+
+REGIAO=us-east-1
+CONTA=CONTA_AWS
+BUCKET=tcc2-pacotes-CONTA_AWS-us-east-1
+P1=i-EXEMPLO
+P2=i-EXEMPLO
+Q1=i-EXEMPLO
+Q2=i-EXEMPLO
+MOTOR=i-EXEMPLO
+IDS=("$P1" "$P2" "$Q1" "$Q2" "$MOTOR")
+RUN="$(date -u +%Y%m%d_%H%M%S)"
+PREFIXO="resultados/consultas_concorrentes/$RUN"
+LIGOU=0
+FALHAS=0
+LIMITE=$(( $(date +%s) + 1920 ))
+
+log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+finalizar() {
+  local codigo=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    log 'Solicitando parada das cinco EC2 utilizadas nesta rodada.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null || codigo=1
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+      log 'Cinco EC2 confirmadas desligadas.'
+    else
+      log 'ATENCAO: parada nao confirmada. Conferir EC2 no console.'
+      codigo=1
+    fi
+  fi
+  if (( LIGOU )); then log "Evidencias: s3://$BUCKET/$PREFIXO/"; fi
+  log "Codigo final: $codigo; incidentes: $FALHAS"
+  exit "$codigo"
+}
+trap finalizar EXIT INT TERM
+
+[[ "${1:---check}" = --check || "${1:---check}" = --run ]] || {
+  log 'Uso: bash tcc2_consultas_concorrentes.sh --check | --run'; exit 2;
+}
+for executavel in aws jq; do
+  command -v "$executavel" >/dev/null || { log "Falta comando: $executavel"; exit 1; }
+done
+conta_atual=$(aws sts get-caller-identity --query Account --output text)
+[[ "$conta_atual" = "$CONTA" ]] || { log "Conta AWS inesperada: $conta_atual"; exit 1; }
+dados=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "${IDS[@]}" \
+  --query 'Reservations[].Instances[].[InstanceId,State.Name,InstanceType,VpcId,IamInstanceProfile.Arn]' --output json)
+[[ "$(jq 'length' <<<"$dados")" = 5 ]] || { log 'Nao foram encontradas as cinco instancias.'; exit 1; }
+for id in "${IDS[@]}"; do
+  item=$(jq -c --arg id "$id" '.[] | select(.[0]==$id)' <<<"$dados")
+  [[ -n "$item" ]] || { log "ID nao localizado: $id"; exit 1; }
+  estado=$(jq -r '.[1]' <<<"$item")
+  tipo=$(jq -r '.[2]' <<<"$item")
+  vpc=$(jq -r '.[3]' <<<"$item")
+  iam=$(jq -r '.[4]' <<<"$item")
+  log "$id: $estado | $tipo | $vpc | $iam"
+  [[ "$estado" = stopped && "$tipo" = c7a.2xlarge && "$vpc" = vpc-EXEMPLO \
+     && "$iam" = */TCC2-EC2-Kinesis ]] || { log 'Inventario inesperado; abortando sem iniciar maquinas.'; exit 1; }
+done
+aws s3api head-bucket --bucket "$BUCKET" >/dev/null
+for id in "${IDS[@]}"; do
+  pendentes=$(aws ssm list-command-invocations --region "$REGIAO" --instance-id "$id" \
+    --query "CommandInvocations[?Status=='Pending'||Status=='InProgress'||Status=='Delayed'].CommandId" \
+    --output text)
+  [[ -z "$pendentes" ]] || {
+    log "SSM pendente em $id: $pendentes. Verifique antes de religar esta maquina.";
+    exit 1;
+  }
+done
+log 'Preflight AWS confirmado. Baselines, falhas e streams anteriores nao serao alterados.'
+if [[ "${1:---check}" = --check ]]; then
+  log 'CHECK OK. Nenhuma EC2 ligada. Para executar, use --run (solicita autorizacao de custo).'
+  exit 0
+fi
+
+log 'ATENCAO: --run ligara CINCO EC2 c7a.2xlarge por ate 32 minutos, com custo de computacao, EBS e trafego aplicavel.'
+log 'Serao criadas apenas novas tabelas de teste SQL e novos objetos no S3.'
+read -r -p 'Para autorizar os custos e prosseguir, digite SIM: ' resposta
+[[ "$resposta" = SIM ]] || { log 'Operacao cancelada, sem ligar maquinas.'; exit 0; }
+
+enviar() {
+  local id="$1" script="$2" parametros
+  parametros=$(jq -nc --arg script "$script" '{commands:[$script],executionTimeout:["1000"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript \
+    --instance-ids "$id" --parameters "$parametros" \
+    --query Command.CommandId --output text
+}
+aguardar() {
+  local id="$1" comando="$2" status=''
+  for _ in $(seq 1 220); do
+    if (( $(date +%s) > LIMITE )); then log 'Limite temporal de 32 minutos atingido.'; return 1; fi
+    status=$(aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+      --command-id "$comando" --query Status --output text 2>/dev/null || true)
+    case "$status" in
+      Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable|Terminated) break ;;
+    esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+    --command-id "$comando" \
+    --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json || true
+  [[ "$status" = Success ]]
+}
+rodar() { local id="$1" comando; comando=$(enviar "$id" "$2"); aguardar "$id" "$comando"; }
+substituir() { printf '%s' "${1//__$2__/$3}"; }
+
+log 'Iniciando somente as cinco EC2 identificadas no inventario.'
+LIGOU=1
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+online=0
+for _ in $(seq 1 50); do
+  associados=" $(aws ssm describe-instance-information --region "$REGIAO" \
+    --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' --output text | tr '\t' ' ') "
+  online=1
+  for id in "${IDS[@]}"; do [[ "$associados" == *" $id "* ]] || online=0; done
+  (( online )) && break
+  sleep 10
+done
+(( online )) || { log 'SSM nao entrou online nas cinco EC2; solicitando desligamento.'; exit 1; }
+for id in "${IDS[@]}"; do
+  rodar "$id" $'#!/bin/bash\nset -e\nshutdown -h +32\necho PARADA_DE_SEGURANCA_32_MIN' || exit 1
+done
+
+PREPARAR_MOTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+TABELA="eventos_transporte_consultas_${RUN}"
+BASE="/tmp/tcc2-consultas-$RUN-$ENGINE-motor"
+mkdir -p "$BASE"
+if [[ "$ENGINE" = materialize ]]; then
+  docker stop risingwave-tcc >/dev/null 2>&1 || true
+  docker start materialize-tcc >/dev/null 2>&1 || true
+  PORTA=6875
+  SQL=/opt/tcc2/complementos/AWS/Preparacao/SQL/materialize_criar_tabela.sql
+  for _ in $(seq 1 60); do
+    if docker exec materialize-tcc psql -h localhost -p 6875 -U materialize -d materialize -c 'SELECT 1' >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+else
+  docker stop materialize-tcc >/dev/null 2>&1 || true
+  docker start risingwave-tcc >/dev/null 2>&1 || true
+  PORTA=4566
+  SQL=/opt/tcc2/complementos/AWS/Preparacao/SQL/risingwave_criar_tabela.sql
+  for _ in $(seq 1 60); do
+    if docker run --rm --network host postgres:16-alpine psql -h 127.0.0.1 -p 4566 -U root -d dev -c 'SELECT 1' >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+fi
+test -s "$SQL"
+sed "s/eventos_transporte/$TABELA/g" "$SQL" > "$BASE/criar_tabela.sql"
+if [[ "$ENGINE" = materialize ]]; then
+  docker exec -i materialize-tcc psql -h localhost -p 6875 -U materialize -d materialize -v ON_ERROR_STOP=1 < "$BASE/criar_tabela.sql"
+else
+  docker run --rm -i --network host postgres:16-alpine psql -h 127.0.0.1 -p 4566 -U root -d dev -v ON_ERROR_STOP=1 < "$BASE/criar_tabela.sql"
+fi
+printf 'utc,load_1m,mem_total_kb,mem_available_kb,container_stats\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+ while test -f "$1/monitorar"; do
+  load=$(cut -d" " -f1 /proc/loadavg)
+  total=$(awk "/MemTotal:/{print \$2}" /proc/meminfo)
+  livre=$(awk "/MemAvailable:/{print \$2}" /proc/meminfo)
+  stats=$(docker stats --no-stream --format "{{.Name}}={{.CPUPerc}}/{{.MemUsage}}" 2>/dev/null | tr "\n" ";" || true)
+  printf "%s,%s,%s,%s,\"%s\"\n" "$(date -u +%FT%TZ)" "$load" "$total" "$livre" "$stats" >> "$1/metricas.csv"
+  sleep 3
+ done
+' bash "$BASE" >/dev/null 2>&1 </dev/null &
+echo "MOTOR_PREPARADO=$ENGINE TABELA=$TABELA PORTA=$PORTA"
+REMOTO
+)
+
+JMETER_REMOTO=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+ENGINE=__ENGINE__
+NUM=__NUM__
+RUN=__RUN__
+PAPEL=__PAPEL__
+TABELA="eventos_transporte_consultas_${RUN}"
+BASE="/tmp/tcc2-consultas-$RUN-$ENGINE-$PAPEL-$NUM"
+mkdir -p "$BASE"
+test -x /usr/local/bin/jmeter
+test -x /opt/tcc2/venv/bin/python
+test -d /opt/tcc2/clientes/JMeter/planos
+export ENGINE NUM RUN PAPEL TABELA BASE
+/opt/tcc2/venv/bin/python - <<'PY'
+import os,xml.etree.ElementTree as ET
+from pathlib import Path
+eng=os.environ['ENGINE']; papel=os.environ['PAPEL']; tabela=os.environ['TABELA']
+base=Path(os.environ['BASE'])
+arquivos=Path('/opt/tcc2/clientes/JMeter/planos')
+nome=('Plano_Consultas_'+('Materialize' if eng=='materialize' else 'RisingWave')+'.jmx' if papel=='consulta'
+      else ('Plano de TesteMaterialize.jmx' if eng=='materialize' else 'Plano de TesteRisingWave.jmx'))
+origem=arquivos/nome
+assert origem.is_file(),str(origem)
+arvore=ET.parse(origem); root=arvore.getroot()
+substituicoes=0; habilitados=[]
+for sampler in root.iter('JDBCSampler'):
+    prop=sampler.find("stringProp[@name='query']")
+    if prop is not None and prop.text and 'eventos_transporte' in prop.text:
+        if sampler.get('enabled','true')=='true':
+            prop.text=prop.text.replace('eventos_transporte',tabela)
+            substituicoes+=1
+    if sampler.get('enabled','true')=='true': habilitados.append(sampler.get('testname',''))
+assert substituicoes==(2 if papel=='consulta' else 1),(substituicoes,papel)
+assert len(habilitados)==(2 if papel=='consulta' else 1),habilitados
+for coletor in root.iter('ResultCollector'):
+    coletor.set('enabled','false')
+    caminho=coletor.find("stringProp[@name='filename']")
+    if caminho is not None: caminho.text=''
+delay='60' if papel=='consulta' else '40'
+timer=ET.Element('ConstantTimer',{'guiclass':'ConstantTimerGui','testclass':'ConstantTimer',
+    'testname':'Intervalo controlado em ms','enabled':'true'})
+ET.SubElement(timer,'stringProp',{'name':'ConstantTimer.delay'}).text=delay
+grupos=0
+for pai in root.iter():
+    filhos=list(pai)
+    for i,filho in enumerate(filhos):
+        if filho.tag=='ThreadGroup':
+            assert i+1<len(filhos) and filhos[i+1].tag=='hashTree'
+            filhos[i+1].insert(0,timer); filhos[i+1].insert(1,ET.Element('hashTree'))
+            grupos+=1
+assert grupos==1,grupos
+arvore.write(base/'plano.jmx',encoding='utf-8',xml_declaration=True)
+print('PLANO_VALIDADO:',nome,'samplers:',habilitados,'atraso_ms:',delay,flush=True)
+PY
+PORTA=6875
+[[ "$ENGINE" = risingwave ]] && PORTA=4566
+LOOPS=1000
+AMOSTRAS=5000
+if [[ "$PAPEL" = consulta ]]; then
+  LOOPS=300
+  AMOSTRAS=3000
+  timeout 10 bash -c "echo >/dev/tcp/IP_EXEMPLO/$PORTA" || {
+    echo "PORTA_JDBC_INACESSIVEL=$PORTA (verificar SG e bind do motor)" >&2; exit 1;
+  }
+  printf 'utc,load_1m,mem_total_kb,mem_available_kb\n' > "$BASE/metricas_host.csv"
+  touch "$BASE/monitorar"
+  nohup bash -c '
+   while test -f "$1/monitorar"; do
+    printf "%s,%s,%s,%s\n" "$(date -u +%FT%TZ)" "$(cut -d" " -f1 /proc/loadavg)" \
+      "$(awk "/MemTotal:/{print \$2}" /proc/meminfo)" "$(awk "/MemAvailable:/{print \$2}" /proc/meminfo)" >> "$1/metricas_host.csv"
+    sleep 3
+   done
+  ' bash "$BASE" >/dev/null 2>&1 </dev/null &
+fi
+if [[ "$PAPEL" = produtor ]]; then
+  CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_10000.csv"
+  test -s "$CSV"
+  [[ "$(( $(wc -l < "$CSV") - 1 ))" -eq 5000 ]] || { echo 'CSV de 5000 eventos ausente/invalido' >&2; exit 1; }
+fi
+set +e
+timeout 780 /usr/local/bin/jmeter -n -t "$BASE/plano.jmx" \
+  -Jthreads=5 -Jloops="$LOOPS" -Jdbhost=IP_EXEMPLO -Jdbport="$PORTA" \
+  ${CSV:+-Jcsvfile="$CSV"} \
+  -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+rm -f "$BASE/monitorar"
+export RC AMOSTRAS
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,csv,json,os
+from pathlib import Path
+base=Path(os.environ['BASE']); registros=erros=0
+if (base/'resultado.jtl').exists():
+    with (base/'resultado.jtl').open(encoding='utf-8',newline='') as arq:
+        for item in csv.DictReader(arq):
+            registros+=1; erros+=item.get('success','').lower()!='true'
+info={'motor':os.environ['ENGINE'],'papel':os.environ['PAPEL'],'ec2':os.environ['NUM'],
+      'threads':5,'amostras':registros,'esperado':int(os.environ['AMOSTRAS']),
+      'erros':erros,'jmeter_exit':int(os.environ['RC']),'tabela':os.environ['TABELA']}
+(base/'resumo.json').write_text(json.dumps(info,ensure_ascii=False,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix=f"resultados/consultas_concorrentes/{os.environ['RUN']}/{os.environ['ENGINE']}/{os.environ['PAPEL']}/EC2-{os.environ['NUM']}/"
+for arquivo in base.iterdir():
+    if arquivo.is_file():
+        s3.upload_file(str(arquivo),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+arquivo.name,
+                       ExtraArgs={'ServerSideEncryption':'AES256'})
+print('RESULTADO_JMETER:',info,flush=True)
+assert int(os.environ['RC'])==0 and registros==int(os.environ['AMOSTRAS']) and erros==0, 'JMeter incompleto; veja S3'
+PY
+REMOTO
+)
+
+FINAL_MOTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+TABELA="eventos_transporte_consultas_${RUN}"
+BASE="/tmp/tcc2-consultas-$RUN-$ENGINE-motor"
+rm -f "$BASE/monitorar"
+sleep 4
+if [[ "$ENGINE" = materialize ]]; then
+  VALORES=$(docker exec materialize-tcc psql -h localhost -p 6875 -U materialize -d materialize \
+    -t -A -F '|' -c "SELECT COUNT(*),COUNT(DISTINCT id_evento) FROM $TABELA" | tail -1)
+else
+  VALORES=$(docker run --rm --network host postgres:16-alpine psql -h 127.0.0.1 -p 4566 \
+    -U root -d dev -t -A -F '|' -c "SELECT COUNT(*),COUNT(DISTINCT id_evento) FROM $TABELA" | tail -1)
+fi
+export ENGINE RUN VALORES BASE TABELA
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+base=Path(os.environ['BASE']); qtd,ids=map(int,os.environ['VALORES'].strip().split('|'))
+info={'motor':os.environ['ENGINE'],'eventos_esperados':10000,'registros':qtd,
+      'ids_distintos':ids,'diferenca':10000-qtd,'duplicados':qtd-ids,
+      'tipo':'escrita com duas produtoras e leitura com duas clientes concorrentes'}
+(base/'consistencia.json').write_text(json.dumps(info,ensure_ascii=False,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix=f"resultados/consultas_concorrentes/{os.environ['RUN']}/{os.environ['ENGINE']}/motor/"
+for arquivo in base.iterdir():
+    if arquivo.is_file():
+        s3.upload_file(str(arquivo),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+arquivo.name,
+                       ExtraArgs={'ServerSideEncryption':'AES256'})
+print('CONSISTENCIA:',info,flush=True)
+assert qtd==ids==10000,'Contagem/IDs nao batem; veja S3'
+PY
+REMOTO
+)
+
+for engine in materialize risingwave; do
+  log "========== CONSULTAS CONCORRENTES: $engine =========="
+  script=$(substituir "$(substituir "$PREPARAR_MOTOR" ENGINE "$engine")" RUN "$RUN")
+  rodar "$MOTOR" "$script" || { log "Falha ao preparar $engine"; exit 1; }
+  jobs=()
+  for num in 03 04 01 02; do
+    papel=consulta; id="$Q1"
+    case "$num" in
+      01) papel=produtor; id="$P1" ;;
+      02) papel=produtor; id="$P2" ;;
+      03) id="$Q1" ;;
+      04) id="$Q2" ;;
+    esac
+    script="$JMETER_REMOTO"
+    for parametro in "ENGINE=$engine" "RUN=$RUN" "NUM=$num" "PAPEL=$papel"; do
+      script=$(substituir "$script" "${parametro%%=*}" "${parametro#*=}")
+    done
+    jobs+=("$id:$(enviar "$id" "$script")")
+  done
+  for job in "${jobs[@]}"; do
+    if ! aguardar "${job%%:*}" "${job#*:}"; then
+      log "Falha de execucao no JMeter ${job%%:*}; evidencias disponiveis no S3."
+      FALHAS=$((FALHAS+1))
+    fi
+  done
+  script=$(substituir "$(substituir "$FINAL_MOTOR" ENGINE "$engine")" RUN "$RUN")
+  if ! rodar "$MOTOR" "$script"; then
+    log "Auditoria SQL $engine nao fechou."
+    FALHAS=$((FALHAS+1))
+  fi
+  (( FALHAS == 0 )) || { log "Interrompendo antes do proximo motor por $FALHAS incidente(s)."; exit 1; }
+  log "$engine concluido: dois produtores + dois clientes simultaneos."
+done
+log 'CONSULTAS CONCORRENTES CONCLUIDAS. Escala horizontal e checkpoints sao fases separadas.'

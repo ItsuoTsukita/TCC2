@@ -1,0 +1,540 @@
+Executa o teste final de checkpoint do Flink, reinicia o TaskManager e confere a recuperação.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+REGIAO=us-east-1
+BUCKET=tcc2-pacotes-CONTA_AWS-us-east-1
+P1=i-EXEMPLO
+P2=i-EXEMPLO
+MOTOR=i-EXEMPLO
+IPS_MOTOR=IP_EXEMPLO
+IDS=("$P1" "$P2" "$MOTOR")
+RUN=$(date -u +%Y%m%d_%H%M%S)
+PREFIXO="resultados/checkpoints/flink/$RUN"
+LIGOU=0
+INCIDENTES=0
+LIMITE=$(( $(date +%s) + 1500 ))
+log(){ printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+finalizar(){
+  local rc=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    log 'Desligando somente EC2-01, EC2-02 e EC2-05.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null || rc=1
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+      log 'Tres EC2 confirmadas desligadas.'
+    else
+      log 'ATENCAO: verifique as tres EC2 no console.'
+      rc=1
+    fi
+    log "Evidencias: s3://$BUCKET/$PREFIXO/"
+  fi
+  log "Codigo final: $rc; incidentes: $INCIDENTES"
+  exit "$rc"
+}
+trap finalizar EXIT INT TERM
+modo="${1:---check}"
+[[ "$modo" == --check || "$modo" == --run ]] || { log 'Use --check ou --run'; exit 2; }
+for exe in aws jq python3; do
+  command -v "$exe" >/dev/null || { log "Ausente: $exe"; exit 1; }
+done
+[[ "$(aws sts get-caller-identity --query Account --output text)" == CONTA_AWS ]] || {
+  log 'Conta AWS divergente. Nada iniciado.'; exit 1;
+}
+dados=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "${IDS[@]}" --output json)
+grupos=$(jq -r '.Reservations[].Instances[].SecurityGroups[].GroupId' <<<"$dados" | sort -u)
+[[ -n "$grupos" ]] || { log 'SG nao localizado'; exit 1; }
+readarray -t grupos_ids <<<"$grupos"
+regras=$(aws ec2 describe-security-groups --region "$REGIAO" --group-ids "${grupos_ids[@]}" --output json)
+python3 - "$dados" "$regras" "$P1" "$P2" "$MOTOR" <<'PY'
+import ipaddress,json,sys
+infos=json.loads(sys.argv[1]); regras=json.loads(sys.argv[2])
+p1,p2,motor=sys.argv[3:]
+maquinas={i['InstanceId']:i for r in infos['Reservations'] for i in r['Instances']}
+assert set(maquinas)=={p1,p2,motor},'Instancias inesperadas'
+sgs={g['GroupId']:g for g in regras['SecurityGroups']}
+for id,inst in maquinas.items():
+    print('EC2:',id,inst['State']['Name'],inst['InstanceType'],flush=True)
+    assert inst['State']['Name']=='stopped','EC2 nao esta desligada'
+    assert inst['InstanceType']=='c7a.2xlarge','Tipo EC2 inesperado'
+    assert inst['VpcId']=='vpc-EXEMPLO','VPC divergente'
+    assert inst['IamInstanceProfile']['Arn'].endswith('/TCC2-EC2-Kinesis'),'IAM divergente'
+def regras_perm(a,b,saida):
+    origem=maquinas[a]; destino=maquinas[b]
+    if saida: lado,peer,field=origem,destino,'IpPermissionsEgress'
+    else: lado,peer,field=destino,origem,'IpPermissions'
+    ip=ipaddress.ip_address(peer['PrivateIpAddress'])
+    sgr={g['GroupId'] for g in peer['SecurityGroups']}
+    for g in lado['SecurityGroups']:
+        for p in sgs[g['GroupId']].get(field,[]):
+            proto=str(p.get('IpProtocol',''))
+            if not (proto=='-1' or proto=='tcp' and p.get('FromPort',0)<=9092<=p.get('ToPort',0)):
+                continue
+            if any(x.get('GroupId') in sgr for x in p.get('UserIdGroupPairs',[])):
+                return True
+            if any(ip in ipaddress.ip_network(x['CidrIp'],strict=False) for x in p.get('IpRanges',[])):
+                return True
+    return False
+for produtor in (p1,p2):
+    assert regras_perm(produtor,motor,True),'Saida Kafka bloqueada: '+produtor
+    assert regras_perm(produtor,motor,False),'Entrada Kafka bloqueada: '+produtor
+print('PRECHECK_EC2_E_KAFKA_OK',flush=True)
+PY
+aws s3api head-bucket --bucket "$BUCKET" >/dev/null
+for id in "${IDS[@]}"; do
+  pendente=$(aws ssm list-command-invocations --region "$REGIAO" --instance-id "$id" --query "CommandInvocations[?Status=='Pending'||Status=='InProgress'||Status=='Delayed'].CommandId" --output text)
+  [[ -z "$pendente" ]] || { log "Comandos SSM pendentes em $id"; exit 1; }
+done
+log 'PRECHECK OK: instancias desligadas, rede e S3 conferidos.'
+if [[ "$modo" == --check ]]; then
+  log 'Nenhuma EC2 iniciada. --run exige autorizacao.'
+  exit 0
+fi
+log 'O teste liga TRES EC2 c7a.2xlarge por ate 25 minutos e gera custos.'
+log 'Uma unica carga de 10.000 eventos, sem alterar os baselines nem chamar Kinesis.'
+read -r -p 'Autorizar os custos? Digite SIM: ' confirmar
+[[ "$confirmar" == SIM ]] || { log 'Cancelado sem iniciar EC2.'; exit 0; }
+enviar(){
+  local id="$1" script="$2" payload
+  payload=$(jq -cn --arg s "$script" '{commands:[$s],executionTimeout:["900"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript --instance-ids "$id" --parameters "$payload" --query Command.CommandId --output text
+}
+aguardar(){
+  local id="$1" cmd="$2" st=''
+  for _ in $(seq 1 180); do
+    (( $(date +%s) < LIMITE )) || { log 'Limite de 25 minutos atingido.'; return 1; }
+    st=$(aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" --command-id "$cmd" --query Status --output text 2>/dev/null || true)
+    case "$st" in Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable|Terminated) break;; esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" --command-id "$cmd" --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json || true
+  [[ "$st" == Success ]]
+}
+rodar(){ local c; c=$(enviar "$1" "$2"); aguardar "$1" "$c"; }
+substituir(){ printf '%s' "${1//__$2__/$3}"; }
+LIGOU=1
+log 'Iniciando EC2-01, EC2-02 e EC2-05.'
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+online=0
+for _ in $(seq 1 45); do
+  ativos=" $(aws ssm describe-instance-information --region "$REGIAO" --output json | jq -r '.InstanceInformationList[]|select(.PingStatus=="Online")|.InstanceId' | tr '\n' ' ') "
+  online=1
+  for id in "${IDS[@]}"; do [[ "$ativos" == *" $id "* ]] || online=0; done
+  (( online )) && break
+  sleep 10
+done
+(( online )) || { log 'SSM indisponivel; abortando.'; exit 1; }
+for id in "${IDS[@]}"; do
+  rodar "$id" $'#!/bin/bash\nset -e\nshutdown -h +25\necho PARADA_SEGURANCA_25_MIN' || exit 1
+done
+
+VALIDAR_PRODUTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+NUM=__NUM__
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_10000.csv"
+test -s "$CSV"
+test "$(($(wc -l < "$CSV")-1))" -eq 5000
+test -s '/opt/tcc2/clientes/JMeter/planos/Plano de TesteFlink_Kafka.jmx'
+test -x /usr/local/bin/jmeter
+echo "PRODUTOR_VALIDADO=EC2-$NUM LINHAS=5000"
+REMOTO
+)
+for n in 01 02; do
+  id="$P1"; [[ "$n" == 02 ]] && id="$P2"
+  rodar "$id" "$(substituir "$VALIDAR_PRODUTOR" NUM "$n")" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+done
+
+PREPARAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+BASE="/tmp/tcc2-checkpoint-flink-$RUN"
+DIR=/opt/tcc2/complementos/AWS/Preparacao
+TOPICO="tcc2-checkpoint-flink-$RUN"
+TABELA="eventos_checkpoint_$RUN"
+mkdir -p "$BASE/checkpoints"
+chmod 0777 "$BASE/checkpoints"
+export RUN BASE TOPICO TABELA
+registrar_falha(){
+  local rc=$?
+  if (( rc != 0 )); then
+    /opt/tcc2/venv/bin/python - <<'PY' || true
+import boto3,os
+from pathlib import Path
+p=Path(os.environ['BASE'])
+prefix='resultados/checkpoints/flink/'+os.environ['RUN']+'/diagnostico/'
+s3=boto3.client('s3',region_name='us-east-1')
+for nome in ('sql_client.log','jobs.json','config.json','checkpoints_pre.json'):
+    arquivo=p/nome
+    if arquivo.is_file():
+        s3.upload_file(str(arquivo),'tcc2-pacotes-CONTA_AWS-us-east-1',
+                       prefix+nome,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('DIAGNOSTICO_S3:',prefix,flush=True)
+PY
+  fi
+}
+trap registrar_falha EXIT
+cd "$DIR"
+test -s .env
+for arq in flink-sql-connector-kafka-3.4.0-1.20.jar flink-connector-jdbc-3.4.0-1.20.jar postgresql-42.7.4.jar; do test -s "Flink/connectors/$arq"; done
+docker stop materialize-tcc risingwave-tcc arroyo-tcc flink-jobmanager-tcc flink-taskmanager-tcc >/dev/null 2>&1 || true
+docker compose --env-file .env -f docker-compose-flink-kafka.yml up -d kafka postgres
+for _ in $(seq 1 60); do
+  docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1 && docker exec postgres-resultados-tcc pg_isready -U tcc -d tcc >/dev/null 2>&1 && break
+  sleep 3
+done
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null
+docker exec postgres-resultados-tcc pg_isready -U tcc -d tcc >/dev/null
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --create --if-not-exists --topic "$TOPICO" --partitions 3 --replication-factor 1
+docker exec postgres-resultados-tcc psql -U tcc -d tcc -v ON_ERROR_STOP=1 -c "CREATE TABLE $TABELA (id_evento BIGINT PRIMARY KEY,veiculo_id BIGINT,latitude DOUBLE PRECISION,longitude DOUBLE PRECISION,velocidade DOUBLE PRECISION,temperatura_carga DOUBLE PRECISION,status_rota TEXT,data_hora TEXT);"
+PROPS="jobmanager.rpc.address: IP_EXEMPLO
+jobmanager.bind-host: 0.0.0.0
+jobmanager.rpc.port: 6123
+rest.address: IP_EXEMPLO
+rest.bind-address: 0.0.0.0
+rest.port: 8081
+blob.server.port: 6124
+state.backend.type: hashmap
+execution.checkpointing.interval: 2 s
+execution.checkpointing.mode: EXACTLY_ONCE
+execution.checkpointing.storage: filesystem
+execution.checkpointing.dir: file:///opt/flink/checkpoints
+restart-strategy.type: fixed-delay
+restart-strategy.fixed-delay.attempts: 20
+restart-strategy.fixed-delay.delay: 3 s"
+JARS=()
+for arq in flink-sql-connector-kafka-3.4.0-1.20.jar flink-connector-jdbc-3.4.0-1.20.jar postgresql-42.7.4.jar; do
+  JARS+=(-v "$DIR/Flink/connectors/$arq:/opt/flink/lib/$arq:ro")
+done
+docker run -d --name "tcc2-checkpoint-jm-$RUN" --network host -v "$BASE/checkpoints:/opt/flink/checkpoints" -e "FLINK_PROPERTIES=$PROPS" "${JARS[@]}" flink:1.20 jobmanager >/dev/null
+for _ in $(seq 1 50); do
+  curl -fsS http://127.0.0.1:8081/overview >/dev/null 2>&1 && break
+  sleep 2
+done
+curl -fsS http://127.0.0.1:8081/overview >/dev/null
+TMPROPS="jobmanager.rpc.address: IP_EXEMPLO
+jobmanager.rpc.port: 6123
+taskmanager.host: IP_EXEMPLO
+taskmanager.bind-host: 0.0.0.0
+taskmanager.rpc.port: 6122
+taskmanager.data.port: 6125
+taskmanager.numberOfTaskSlots: 4"
+docker run -d --name "tcc2-checkpoint-tm-$RUN" --network host -v "$BASE/checkpoints:/opt/flink/checkpoints" -e "FLINK_PROPERTIES=$TMPROPS" "${JARS[@]}" flink:1.20 taskmanager >/dev/null
+for _ in $(seq 1 45); do
+  if curl -fsS http://127.0.0.1:8081/taskmanagers | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["taskmanagers"])==1' 2>/dev/null; then break; fi
+  sleep 2
+done
+curl -fsS http://127.0.0.1:8081/taskmanagers | python3 -c 'import json,sys; assert len(json.load(sys.stdin)["taskmanagers"])==1'
+/opt/tcc2/venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+senha=next(x.split('=',1)[1].strip().strip('"') for x in Path('/opt/tcc2/complementos/AWS/Preparacao/.env').read_text().splitlines() if x.startswith('TCC_PG_PASSWORD='))
+assert senha and "'" not in senha
+sql="""
+SET 'parallelism.default' = '4';
+SET 'state.backend.type' = 'hashmap';
+SET 'execution.checkpointing.interval' = '2 s';
+SET 'execution.checkpointing.mode' = 'EXACTLY_ONCE';
+SET 'execution.checkpointing.storage' = 'filesystem';
+SET 'execution.checkpointing.dir' = 'file:///opt/flink/checkpoints';
+SET 'restart-strategy.type' = 'fixed-delay';
+SET 'restart-strategy.fixed-delay.attempts' = '20';
+SET 'restart-strategy.fixed-delay.delay' = '3 s';
+CREATE TABLE origem (
+ id_evento BIGINT,veiculo_id BIGINT,latitude DOUBLE,longitude DOUBLE,
+ velocidade DOUBLE,temperatura_carga DOUBLE,status_rota STRING,data_hora STRING,
+ evento_ts AS TO_TIMESTAMP(REPLACE(data_hora,'T',' ')),
+ WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECOND
+) WITH (
+ 'connector'='kafka','topic'='__TOPICO__',
+ 'properties.bootstrap.servers'='IP_EXEMPLO:9092',
+ 'properties.group.id'='tcc2-checkpoint-__RUN__',
+ 'scan.startup.mode'='earliest-offset','format'='json'
+);
+CREATE TABLE destino (
+ id_evento BIGINT,veiculo_id BIGINT,latitude DOUBLE,longitude DOUBLE,
+ velocidade DOUBLE,temperatura_carga DOUBLE,status_rota STRING,data_hora STRING,
+ PRIMARY KEY(id_evento) NOT ENFORCED
+) WITH (
+ 'connector'='jdbc','url'='jdbc:postgresql://IP_EXEMPLO:5432/tcc',
+ 'table-name'='__TABELA__','username'='tcc','password'='__SENHA__'
+);
+INSERT INTO destino
+ SELECT id_evento,veiculo_id,latitude,longitude,velocidade,temperatura_carga,status_rota,data_hora
+ FROM (
+   SELECT *,ROW_NUMBER() OVER(PARTITION BY id_evento ORDER BY evento_ts DESC) rn
+   FROM origem
+ ) WHERE rn=1;
+"""
+for chave,valor in {'TOPICO':os.environ['TOPICO'],'RUN':os.environ['RUN'],'TABELA':os.environ['TABELA'],'SENHA':senha}.items():
+    sql=sql.replace('__'+chave+'__',valor)
+assert '__' not in sql
+(Path(os.environ['BASE'])/'pipeline.sql').write_text(sql)
+PY
+docker cp "$BASE/pipeline.sql" "tcc2-checkpoint-jm-$RUN:/tmp/pipeline_checkpoint.sql"
+timeout 180 docker exec "tcc2-checkpoint-jm-$RUN" /opt/flink/bin/sql-client.sh -f /tmp/pipeline_checkpoint.sql > "$BASE/sql_client.log" 2>&1 || { tail -n 60 "$BASE/sql_client.log"; exit 1; }
+for _ in $(seq 1 40); do
+  curl -fsS http://127.0.0.1:8081/jobs/overview > "$BASE/jobs.json"
+  if python3 - "$BASE/jobs.json" 2>/dev/null <<'PY'
+import json,sys
+assert len([j for j in json.load(open(sys.argv[1]))['jobs'] if j['state']=='RUNNING'])==1
+PY
+  then break; fi
+  sleep 3
+done
+/opt/tcc2/venv/bin/python - <<'PY'
+import json,os,urllib.request
+from pathlib import Path
+base=Path(os.environ['BASE'])
+jobs=json.loads((base/'jobs.json').read_text())['jobs']
+ativos=[j for j in jobs if j['state']=='RUNNING']
+assert len(ativos)==1,'Job Flink nao iniciou'
+jid=ativos[0]['jid']
+(base/'job_id.txt').write_text(jid)
+with urllib.request.urlopen('http://127.0.0.1:8081/jobs/'+jid+'/checkpoints/config',timeout=12) as r:
+    cfg=json.load(r)
+(base/'config.json').write_text(json.dumps(cfg,indent=2))
+assert str(cfg.get('mode','')).lower()=='exactly_once','Modo de checkpoint divergente'
+assert cfg.get('interval')==2000,'Intervalo de checkpoint inesperado'
+assert cfg.get('checkpoint_storage')=='FileSystemCheckpointStorage','Armazenamento de checkpoint divergente'
+assert cfg.get('state_backend')=='HashMapStateBackend','Backend de estado divergente'
+print('JOB_CHECKPOINT_CONFIGURADO:',jid,
+      'intervalo_ms=',cfg['interval'],
+      'modo=',cfg['mode'],
+      'storage=',cfg['checkpoint_storage'],flush=True)
+PY
+printf 'utc,cpu_docker,mem_docker\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+while test -f "$1/monitorar"; do
+  stats=$(docker stats --no-stream --format "{{.CPUPerc}}|{{.MemUsage}}" "$2" 2>/dev/null | head -1 || true)
+  printf "%s,\"%s\",\"%s\"\n" "$(date -u +%FT%TZ)" "${stats%%|*}" "${stats#*|}" >> "$1/metricas.csv"
+  sleep 3
+done
+' bash "$BASE" "tcc2-checkpoint-tm-$RUN" >/dev/null 2>&1 </dev/null &
+echo "PIPELINE_CHECKPOINT_PRONTA topico=$TOPICO tabela=$TABELA"
+REMOTO
+)
+
+PRODUZIR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+NUM=__NUM__
+RUN=__RUN__
+BASE="/tmp/tcc2-checkpoint-flink-$RUN-EC2-$NUM"
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_10000.csv"
+TOPICO="tcc2-checkpoint-flink-$RUN"
+mkdir -p "$BASE"
+export NUM RUN BASE CSV TOPICO
+python3 - <<'PY'
+import os,xml.etree.ElementTree as ET
+from pathlib import Path
+arv=ET.parse('/opt/tcc2/clientes/JMeter/planos/Plano de TesteFlink_Kafka.jmx')
+root=arv.getroot()
+alterados=0
+for item in root.iter('JSR223Sampler'):
+    if item.get('enabled','true')=='false': continue
+    codigo=item.find("stringProp[@name='script']")
+    if codigo is not None and codigo.text and '"eventos-transporte"' in codigo.text:
+        codigo.text=codigo.text.replace('"eventos-transporte"','"'+os.environ['TOPICO']+'"')
+        alterados+=1
+assert alterados==1,alterados
+for coletor in root.iter('ResultCollector'):
+    coletor.set('enabled','false')
+    p=coletor.find("stringProp[@name='filename']")
+    if p is not None:p.text=''
+timer=ET.Element('ConstantTimer',{'guiclass':'ConstantTimerGui','testclass':'ConstantTimer','testname':'Pausa 60 ms','enabled':'true'})
+ET.SubElement(timer,'stringProp',{'name':'ConstantTimer.delay'}).text='60'
+grupos=0
+for pai in root.iter():
+    filhos=list(pai)
+    for i,filho in enumerate(filhos):
+        if filho.tag=='ThreadGroup':
+            assert i+1<len(filhos) and filhos[i+1].tag=='hashTree'
+            filhos[i+1].insert(0,timer)
+            filhos[i+1].insert(1,ET.Element('hashTree'))
+            grupos+=1
+assert grupos==1
+arv.write(Path(os.environ['BASE'])/'plano.jmx',encoding='utf-8',xml_declaration=True)
+PY
+set +e
+timeout 400 /usr/local/bin/jmeter -n -t "$BASE/plano.jmx" -Jthreads=5 -Jloops=1000 -Jcsvfile="$CSV" -Jkafkaserver=IP_EXEMPLO:9092 -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+export RC
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,csv,json,os
+from pathlib import Path
+p=Path(os.environ['BASE']); total=erros=0
+if (p/'resultado.jtl').exists():
+    with (p/'resultado.jtl').open(encoding='utf-8',newline='') as a:
+        for linha in csv.DictReader(a):
+            total+=1
+            erros+=linha.get('success','').lower()!='true'
+info={'motor':'flink','teste':'checkpoint_recuperacao','ec2':os.environ['NUM'],'esperadas':5000,'amostras':total,'erros':erros,'jmeter_exit':int(os.environ['RC'])}
+(p/'resumo.json').write_text(json.dumps(info,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix='resultados/checkpoints/flink/'+os.environ['RUN']+'/EC2-'+os.environ['NUM']+'/'
+for f in p.iterdir():
+    if f.is_file():
+        s3.upload_file(str(f),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+f.name,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('JMETER_CHECKPOINT:',info,flush=True)
+assert int(os.environ['RC'])==0 and total==5000 and erros==0,'JMeter incompleto'
+PY
+REMOTO
+)
+
+INJETAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+BASE="/tmp/tcc2-checkpoint-flink-$RUN"
+TOPICO="tcc2-checkpoint-flink-$RUN"
+JID=$(cat "$BASE/job_id.txt")
+export RUN BASE JID
+diagnostico(){
+  local rc=$?
+  if (( rc != 0 )); then
+    /opt/tcc2/venv/bin/python - <<'PY' || true
+import boto3,os
+from pathlib import Path
+p=Path(os.environ['BASE'])
+prefix='resultados/checkpoints/flink/'+os.environ['RUN']+'/motor/'
+s3=boto3.client('s3',region_name='us-east-1')
+for nome in ('checkpoints_pre.json','checkpoints_pos.json','falha.json','metricas.csv'):
+    f=p/nome
+    if f.is_file():
+        s3.upload_file(str(f),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+nome,ExtraArgs={'ServerSideEncryption':'AES256'})
+PY
+  fi
+}
+trap diagnostico EXIT
+pre=0
+offset=0
+for _ in $(seq 1 90); do
+  offset=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 | awk -F: '{s+=$3} END{print s+0}')
+  curl -fsS "http://127.0.0.1:8081/jobs/$JID/checkpoints" > "$BASE/checkpoints_pre.json"
+  pre=$(python3 - "$BASE/checkpoints_pre.json" <<'PY'
+import json,sys
+print(json.load(open(sys.argv[1]))['counts']['completed'])
+PY
+)
+  if (( offset>=600 && offset<8500 && pre>=1 )); then break; fi
+  sleep 2
+done
+if (( offset<600 || offset>=8500 || pre<1 )); then
+  echo "FALHA_NAO_INJETADA: eventos=$offset checkpoints=$pre" >&2
+  exit 1
+fi
+echo "ANTES_DA_FALHA: eventos=$offset checkpoints_completos=$pre"
+INICIO=$(date -u +%FT%T.%NZ)
+docker stop -t 2 "tcc2-checkpoint-tm-$RUN" >/dev/null
+sleep 8
+docker start "tcc2-checkpoint-tm-$RUN" >/dev/null
+FIM=$(date -u +%FT%T.%NZ)
+export INICIO FIM OFFSET="$offset" PRE="$pre"
+restaurados=0
+estado=''
+for _ in $(seq 1 100); do
+  curl -fsS "http://127.0.0.1:8081/jobs/$JID/checkpoints" > "$BASE/checkpoints_pos.json" || true
+  restaurados=$(python3 - "$BASE/checkpoints_pos.json" <<'PY'
+import json,sys
+try:
+    print(json.load(open(sys.argv[1]))['counts']['restored'])
+except (OSError,KeyError,ValueError):
+    print(0)
+PY
+)
+  estado=$(curl -fsS "http://127.0.0.1:8081/jobs/$JID" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("state",""))' 2>/dev/null || true)
+  if (( restaurados>=1 )) && [[ "$estado" == RUNNING ]]; then break; fi
+  [[ "$estado" == FAILED || "$estado" == CANCELED ]] && break
+  sleep 3
+done
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+p=Path(os.environ['BASE'])
+anterior=json.loads((p/'checkpoints_pre.json').read_text())
+depois=json.loads((p/'checkpoints_pos.json').read_text())
+info={'teste':'flink_checkpoint_recuperacao','inicio_falha_utc':os.environ['INICIO'],'fim_falha_utc':os.environ['FIM'],
+      'eventos_antes_falha':int(os.environ['OFFSET']),'checkpoints_completos_antes':int(os.environ['PRE']),
+      'checkpoints_completos_depois':depois['counts'].get('completed',0),
+      'checkpoints_restaurados':depois['counts'].get('restored',0),'job_id':os.environ['JID']}
+(p/'falha.json').write_text(json.dumps(info,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix='resultados/checkpoints/flink/'+os.environ['RUN']+'/motor/'
+for nome in ('checkpoints_pre.json','checkpoints_pos.json','falha.json'):
+    s3.upload_file(str(p/nome),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+nome,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('RECUPERACAO_CHECKPOINT:',info,flush=True)
+assert info['checkpoints_restaurados']>=1,'Nenhum checkpoint restaurado'
+PY
+[[ "$estado" == RUNNING ]] || { echo "JOB_NAO_RECUPERADO: $estado" >&2; exit 1; }
+REMOTO
+)
+
+AUDITAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+RUN=__RUN__
+BASE="/tmp/tcc2-checkpoint-flink-$RUN"
+TABELA="eventos_checkpoint_$RUN"
+TOPICO="tcc2-checkpoint-flink-$RUN"
+JID=$(cat "$BASE/job_id.txt")
+total=0
+distintos=0
+for _ in $(seq 1 90); do
+  resultado=$(docker exec postgres-resultados-tcc psql -U tcc -d tcc -t -A -c "SELECT COUNT(*)||','||COUNT(DISTINCT id_evento) FROM $TABELA")
+  IFS=, read -r total distintos <<<"$resultado"
+  [[ "$total" == 10000 && "$distintos" == 10000 ]] && break
+  sleep 3
+done
+offset=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 | awk -F: '{s+=$3} END{print s+0}')
+curl -fsS "http://127.0.0.1:8081/jobs/$JID/checkpoints" > "$BASE/checkpoints_final.json"
+curl -fsS "http://127.0.0.1:8081/jobs/$JID" > "$BASE/job_final.json"
+rm -f "$BASE/monitorar"
+sleep 3
+export RUN BASE TOTAL="$total" DISTINTOS="$distintos" OFFSET="$offset"
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+p=Path(os.environ['BASE'])
+ck=json.loads((p/'checkpoints_final.json').read_text())
+job=json.loads((p/'job_final.json').read_text())
+info={'motor':'flink','tipo':'checkpoint_recuperacao_apos_reinicio_taskmanager',
+      'entradas_kafka':int(os.environ['OFFSET']),'registros_postgres':int(os.environ['TOTAL']),
+      'ids_distintos_postgres':int(os.environ['DISTINTOS']),'checkpoint_completos':ck['counts'].get('completed',0),
+      'checkpoint_restaurados':ck['counts'].get('restored',0),'job_estado':job.get('state',''),
+      'observacao':'Estado Flink com checkpoint EXACTLY_ONCE; saida JDBC idempotente por PK, nao transacao distribuida exatamente uma vez.'}
+(p/'consistencia.json').write_text(json.dumps(info,indent=2,ensure_ascii=False))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix='resultados/checkpoints/flink/'+os.environ['RUN']+'/motor/'
+for nome in ('config.json','checkpoints_pre.json','checkpoints_pos.json','checkpoints_final.json',
+             'job_final.json','falha.json','consistencia.json','metricas.csv','sql_client.log'):
+    f=p/nome
+    if f.is_file():
+        s3.upload_file(str(f),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+nome,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('AUDITORIA_CHECKPOINT:',info,flush=True)
+assert info['entradas_kafka']==10000 and info['registros_postgres']==10000 and info['ids_distintos_postgres']==10000
+assert info['checkpoint_completos']>=1 and info['checkpoint_restaurados']>=1 and info['job_estado']=='RUNNING'
+PY
+REMOTO
+)
+
+log 'Preparando Flink com armazenamento compartilhado dos checkpoints na EC2-05.'
+rodar "$MOTOR" "$(substituir "$PREPARAR" RUN "$RUN")" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+jobs=()
+for n in 01 02; do
+  id="$P1"; [[ "$n" == 02 ]] && id="$P2"
+  script="$(substituir "$(substituir "$PRODUZIR" NUM "$n")" RUN "$RUN")"
+  jobs+=("$id:$(enviar "$id" "$script")")
+done
+log 'Carga JMeter iniciada nas duas EC2; aguardando checkpoint antes da falha.'
+rodar "$MOTOR" "$(substituir "$INJETAR" RUN "$RUN")" || { INCIDENTES=$((INCIDENTES+1)); log 'Teste de recuperacao nao validado; evidencias preservadas.'; exit 1; }
+for job in "${jobs[@]}"; do
+  aguardar "${job%%:*}" "${job#*:}" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+done
+rodar "$MOTOR" "$(substituir "$AUDITAR" RUN "$RUN")" || { INCIDENTES=$((INCIDENTES+1)); exit 1; }
+log 'CHECKPOINTING CONCLUIDO: checkpoint restaurado, 10.000 IDs presentes, 0 erros JMeter.'

@@ -1,0 +1,323 @@
+Pausa Materialize e RisingWave durante a carga e confere as respostas e os dados.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+REGIAO=us-east-1
+BUCKET=tcc2-pacotes-CONTA_AWS-us-east-1
+P1=i-EXEMPLO
+P2=i-EXEMPLO
+MOTOR=i-EXEMPLO
+IDS=("$P1" "$P2" "$MOTOR")
+RUN="$(date -u +%Y%m%d_%H%M%S)"
+PREFIXO="resultados/falhas/sql/$RUN"
+INICIO=$(( $(date +%s) + 2400 ))
+LIGOU=0
+FALHAS=0
+log() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+encerrar() {
+  local codigo=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    log 'Desligando somente EC2-01, EC2-02 e EC2-05.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null 2>&1 || true
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+      log 'Tres EC2 confirmadas desligadas.'
+    else
+      log 'ATENCAO: confirme as EC2 no console.'
+      codigo=1
+    fi
+  fi
+  log "Resultados: s3://$BUCKET/$PREFIXO/"
+  log "Codigo final: $codigo; cenarios com falha de execucao: $FALHAS"
+  exit "$codigo"
+}
+trap encerrar EXIT INT TERM
+for programa in aws jq; do command -v "$programa" >/dev/null || { log "Falta $programa"; exit 1; }; done
+test "$(aws sts get-caller-identity --query Account --output text)" = CONTA_AWS
+for id in "${IDS[@]}"; do
+  estado=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)
+  log "$id: $estado"
+  test "$estado" = stopped || { log 'ABORTADO: uma EC2 nao esta desligada.'; exit 1; }
+done
+
+enviar() {
+  local id="$1" script="$2" parametros
+  parametros=$(jq -nc --arg s "$script" '{commands:[$s],executionTimeout:["900"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript \
+    --instance-ids "$id" --parameters "$parametros" \
+    --query Command.CommandId --output text
+}
+aguardar() {
+  local id="$1" cmd="$2" estado=''
+  for t in $(seq 1 180); do
+    if (( $(date +%s) > INICIO )); then log 'Limite de 40 minutos'; return 1; fi
+    estado=$(aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+      --command-id "$cmd" --query Status --output text 2>/dev/null || true)
+    case "$estado" in Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable) break;; esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+    --command-id "$cmd" \
+    --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json || true
+  [[ "$estado" = Success ]]
+}
+rodar() { local id="$1" cmd; cmd=$(enviar "$id" "$2"); aguardar "$id" "$cmd"; }
+preencher() { local s="$1" k="$2" v="$3"; printf '%s' "${s//__${k}__/$v}"; }
+
+log 'Ligando tres EC2 para testes de falha; baseline nao sera repetido.'
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+LIGOU=1
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+online=0
+for t in $(seq 1 45); do
+  ativos=" $(aws ssm describe-instance-information --region "$REGIAO" \
+    --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+    --output text | tr '\t' ' ') "
+  online=1
+  for id in "${IDS[@]}"; do [[ "$ativos" == *" $id "* ]] || online=0; done
+  (( online )) && break
+  sleep 10
+done
+(( online )) || { log 'SSM offline'; exit 1; }
+for id in "${IDS[@]}"; do
+  rodar "$id" $'#!/bin/bash\nset -e\nshutdown -h +40\necho PARADA_DE_SEGURANCA_40_MIN' || exit 1
+done
+
+PREPARAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+BASE="/tmp/tcc2-falhas-sql-$RUN-$ENGINE-motor"
+TABELA="eventos_transporte_falhas_${RUN}"
+mkdir -p "$BASE"
+if [[ "$ENGINE" = materialize ]]; then
+  docker stop risingwave-tcc >/dev/null 2>&1 || true
+  docker start materialize-tcc >/dev/null 2>&1 || true
+  for i in $(seq 1 60); do
+    if docker exec materialize-tcc psql -h localhost -p 6875 \
+      -U materialize -d materialize -c 'SELECT 1' >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+  SQL=/opt/tcc2/complementos/AWS/Preparacao/SQL/materialize_criar_tabela.sql
+  sed "s/eventos_transporte/$TABELA/g" "$SQL" > "$BASE/criar_tabela.sql"
+  docker exec -i materialize-tcc psql -h localhost -p 6875 \
+    -U materialize -d materialize -v ON_ERROR_STOP=1 < "$BASE/criar_tabela.sql"
+else
+  docker stop materialize-tcc >/dev/null 2>&1 || true
+  docker start risingwave-tcc >/dev/null 2>&1 || true
+  for i in $(seq 1 60); do
+    if docker run --rm --network host postgres:16-alpine psql -h 127.0.0.1 \
+      -p 4566 -U root -d dev -c 'SELECT 1' >/dev/null 2>&1; then break; fi
+    sleep 3
+  done
+  SQL=/opt/tcc2/complementos/AWS/Preparacao/SQL/risingwave_criar_tabela.sql
+  sed "s/eventos_transporte/$TABELA/g" "$SQL" > "$BASE/criar_tabela.sql"
+  docker run --rm -i --network host postgres:16-alpine psql -h 127.0.0.1 \
+    -p 4566 -U root -d dev -v ON_ERROR_STOP=1 < "$BASE/criar_tabela.sql"
+fi
+printf 'utc,load_1m,mem_total_kb,mem_available_kb,container_stats\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+ while test -f "$1/monitorar"; do
+  load=$(cut -d" " -f1 /proc/loadavg)
+  total=$(awk "/MemTotal:/{print \$2}" /proc/meminfo)
+  livre=$(awk "/MemAvailable:/{print \$2}" /proc/meminfo)
+  stats=$(docker stats --no-stream --format "{{.Name}}={{.CPUPerc}}/{{.MemUsage}}" 2>/dev/null | tr "\n" ";" || true)
+  printf "%s,%s,%s,%s,\"%s\"\n" "$(date -u +%FT%TZ)" "$load" "$total" "$livre" "$stats" >> "$1/metricas.csv"
+  sleep 3
+ done
+' bash "$BASE" >/dev/null 2>&1 </dev/null &
+echo "MOTOR_PREPARADO=$ENGINE TABELA=$TABELA"
+REMOTO
+)
+
+PRODUTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+NUM=__NUM__
+RUN=__RUN__
+TABELA="eventos_transporte_falhas_${RUN}"
+BASE="/tmp/tcc2-falhas-sql-$RUN-$ENGINE-EC2-$NUM"
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_10000.csv"
+mkdir -p "$BASE"
+test -s "$CSV"
+test "$(($(wc -l < "$CSV")-1))" = 5000
+export ENGINE NUM RUN BASE TABELA
+python3 - <<'PY'
+import os
+import xml.etree.ElementTree as ET
+from pathlib import Path
+raiz=Path('/opt/tcc2/clientes/JMeter/planos')
+nome='Plano de TesteMaterialize.jmx' if os.environ['ENGINE']=='materialize' else 'Plano de TesteRisingWave.jmx'
+arvore=ET.parse(raiz/nome)
+root=arvore.getroot()
+substituidas=0
+for elem in root.iter('JDBCSampler'):
+    q=elem.find("stringProp[@name='query']")
+    if q is not None and q.text and 'INSERT INTO eventos_transporte (' in q.text:
+        q.text=q.text.replace('INSERT INTO eventos_transporte (','INSERT INTO '+os.environ['TABELA']+' (')
+        substituidas+=1
+assert substituidas==1, 'Nao foi possivel isolar a tabela do teste'
+for item in root.iter('ResultCollector'):
+    item.set('enabled','false')
+    arquivo=item.find("stringProp[@name='filename']")
+    if arquivo is not None: arquivo.text=''
+timer=ET.Element('ConstantTimer',{'guiclass':'ConstantTimerGui','testclass':'ConstantTimer','testname':'Pausa 40 ms entre amostras','enabled':'true'})
+ET.SubElement(timer,'stringProp',{'name':'ConstantTimer.delay'}).text='40'
+grupos=0
+for pai in root.iter():
+    filhos=list(pai)
+    for i, filho in enumerate(filhos):
+        if filho.tag=='ThreadGroup':
+            assert i+1<len(filhos) and filhos[i+1].tag=='hashTree'
+            filhos[i+1].insert(0,timer)
+            filhos[i+1].insert(1,ET.Element('hashTree'))
+            grupos+=1
+assert grupos==1
+arvore.write(Path(os.environ['BASE'])/'plano.jmx',encoding='utf-8',xml_declaration=True)
+PY
+PORT=6875
+[[ "$ENGINE" = risingwave ]] && PORT=4566
+set +e
+timeout 650 /usr/local/bin/jmeter -n -t "$BASE/plano.jmx" \
+  -Jthreads=5 -Jloops=1000 -Jcsvfile="$CSV" \
+  -Jdbhost=IP_EXEMPLO -Jdbport="$PORT" \
+  -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+export RC
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,csv,json,os
+from pathlib import Path
+base=Path(os.environ['BASE']); linhas=erros=0
+if (base/'resultado.jtl').is_file():
+ with (base/'resultado.jtl').open(encoding='utf-8',newline='') as f:
+  for item in csv.DictReader(f):
+   linhas+=1
+   erros+=item.get('success','').lower()!='true'
+info={'motor':os.environ['ENGINE'],'volume':10000,'ec2':os.environ['NUM'],
+      'threads':5,'amostras':linhas,'esperadas':5000,'erros':erros,
+      'jmeter_exit':int(os.environ['RC']),'falha_planejada':'pause_8segundos'}
+(base/'resumo.json').write_text(json.dumps(info,indent=2))
+destino=f"resultados/falhas/sql/{os.environ['RUN']}/{os.environ['ENGINE']}/EC2-{os.environ['NUM']}/"
+s3=boto3.client('s3',region_name='us-east-1')
+for p in base.iterdir():
+ if p.is_file():
+  s3.upload_file(str(p),'tcc2-pacotes-CONTA_AWS-us-east-1',destino+p.name,
+                 ExtraArgs={'ServerSideEncryption':'AES256'})
+print('JMETER_FALHA:',info,flush=True)
+assert int(os.environ['RC'])==0 and linhas==5000, 'Amostras incompletas. Ver S3.'
+PY
+REMOTO
+)
+
+INJETAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+BASE="/tmp/tcc2-falhas-sql-$RUN-$ENGINE-motor"
+CONT=materialize-tcc
+[[ "$ENGINE" = risingwave ]] && CONT=risingwave-tcc
+sleep 5
+INICIO=$(date -u +%FT%T.%NZ)
+docker pause "$CONT"
+sleep 8
+docker unpause "$CONT"
+FIM=$(date -u +%FT%T.%NZ)
+export ENGINE RUN BASE INICIO FIM CONT
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+p=Path(os.environ['BASE'])
+info={'engine':os.environ['ENGINE'],'componente':os.environ['CONT'],
+      'tipo':'docker pause/unpause','inicio_utc':os.environ['INICIO'],
+      'fim_utc':os.environ['FIM'],'duracao_planejada_segundos':8}
+(p/'falha.json').write_text(json.dumps(info,indent=2))
+boto3.client('s3',region_name='us-east-1').upload_file(
+ str(p/'falha.json'),'tcc2-pacotes-CONTA_AWS-us-east-1',
+ f"resultados/falhas/sql/{os.environ['RUN']}/{os.environ['ENGINE']}/motor/falha.json",
+ ExtraArgs={'ServerSideEncryption':'AES256'})
+print('FALHA_INJETADA:',info,flush=True)
+PY
+REMOTO
+)
+
+FINAL=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+TABELA="eventos_transporte_falhas_${RUN}"
+BASE="/tmp/tcc2-falhas-sql-$RUN-$ENGINE-motor"
+rm -f "$BASE/monitorar"
+sleep 5
+if [[ "$ENGINE" = materialize ]]; then
+  LINHA=$(docker exec materialize-tcc psql -h localhost -p 6875 \
+    -U materialize -d materialize -t -A -F '|' \
+    -c "SELECT COUNT(*),COUNT(DISTINCT id_evento) FROM $TABELA" | tail -1)
+else
+  LINHA=$(docker run --rm --network host postgres:16-alpine psql \
+    -h 127.0.0.1 -p 4566 -U root -d dev -t -A -F '|' \
+    -c "SELECT COUNT(*),COUNT(DISTINCT id_evento) FROM $TABELA" | tail -1)
+fi
+export ENGINE RUN BASE LINHA
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,json,os
+from pathlib import Path
+p=Path(os.environ['BASE']); total,distintos=map(int,os.environ['LINHA'].strip().split('|'))
+info={'motor':os.environ['ENGINE'],'esperado':10000,'registros':total,
+      'ids_distintos':distintos,'dif_eventos':10000-total,
+      'repeticoes_internas':total-distintos,'observacao':'Teste de falha, nao baseline.'}
+(p/'consistencia.json').write_text(json.dumps(info,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+prefix=f"resultados/falhas/sql/{os.environ['RUN']}/{os.environ['ENGINE']}/motor/"
+for arq in p.iterdir():
+ if arq.is_file():
+  s3.upload_file(str(arq),'tcc2-pacotes-CONTA_AWS-us-east-1',prefix+arq.name,
+                 ExtraArgs={'ServerSideEncryption':'AES256'})
+print('CONSISTENCIA_POS_FALHA:',info,flush=True)
+PY
+REMOTO
+)
+
+for engine in materialize risingwave; do
+  log "========== $engine: falha sob carga (10.000 eventos) =========="
+  preparar=$(preencher "$(preencher "$PREPARAR" ENGINE "$engine")" RUN "$RUN")
+  rodar "$MOTOR" "$preparar" || { log "Falha preparando $engine"; exit 1; }
+  jobs=()
+  for num in 01 02; do
+    id="$P1"; [[ "$num" = 02 ]] && id="$P2"
+    script="$PRODUTOR"
+    for par in "ENGINE=$engine" "RUN=$RUN" "NUM=$num"; do
+      script=$(preencher "$script" "${par%%=*}" "${par#*=}")
+    done
+    jobs+=("$id:$(enviar "$id" "$script")")
+  done
+  falha=$(preencher "$(preencher "$INJETAR" ENGINE "$engine")" RUN "$RUN")
+  if ! rodar "$MOTOR" "$falha"; then
+    log "Falha programada apresentou erro de execucao em $engine"
+    FALHAS=$((FALHAS+1))
+  fi
+  for job in "${jobs[@]}"; do
+    if ! aguardar "${job%%:*}" "${job#*:}"; then
+      log "JMeter nao completou todas as amostras para ${job%%:*}"
+      FALHAS=$((FALHAS+1))
+    fi
+  done
+  final=$(preencher "$(preencher "$FINAL" ENGINE "$engine")" RUN "$RUN")
+  if ! rodar "$MOTOR" "$final"; then
+    log "Auditoria final de $engine com erro"
+    FALHAS=$((FALHAS+1))
+  fi
+  log "MOTOR $engine CONCLUIDO; ver diferencas de recuperacao no S3."
+done
+log 'Testes de falha SQL concluídos. Materialize e RisingWave foram testados; outros motores nao foram executados.'
+if (( FALHAS > 0 )); then
+  log "Ocorreram $FALHAS falhas de execucao; arquivos S3 preservados."
+  exit 1
+fi

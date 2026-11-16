@@ -1,0 +1,592 @@
+Executa os testes complementares de falha do Arroyo e do consumidor Kinesis.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+REGIAO=us-east-1
+BUCKET=tcc2-pacotes-CONTA_AWS-us-east-1
+P1=i-EXEMPLO
+P2=i-EXEMPLO
+MOTOR=i-EXEMPLO
+IDS=("$P1" "$P2" "$MOTOR")
+RUN=$(date -u +%Y%m%d_%H%M%S)
+PREFIXO="resultados/falhas/streams/$RUN"
+TOPICO="eventos-transporte-falhas-$RUN-arroyo"
+SAIDA="resultados-arroyo-falhas-$RUN"
+STREAM="tcc2-auto-$RUN-10000"
+TEMPO_FINAL=$(( $(date +%s) + 3300 ))
+LIGOU=0
+STREAM_CRIADO=0
+INCIDENTES=0
+log(){ printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+encerrar(){
+  local codigo=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    log 'Desligando somente EC2-01, EC2-02 e EC2-05.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null 2>&1 || true
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+      log 'Tres EC2 confirmadas desligadas.'
+    else
+      log 'ATENCAO: confirme o desligamento das 3 EC2 no console.'
+      codigo=1
+    fi
+  fi
+  if (( STREAM_CRIADO )); then
+    log "Excluindo exclusivamente o stream temporario $STREAM"
+    aws kinesis delete-stream --region "$REGIAO" --stream-name "$STREAM" \
+      --enforce-consumer-deletion >/dev/null 2>&1 || { log 'ATENCAO: exclusao do stream falhou.'; codigo=1; }
+  fi
+  log "Evidencias: s3://$BUCKET/$PREFIXO/"
+  log "Codigo final: $codigo; incidentes de execucao: $INCIDENTES"
+  exit "$codigo"
+}
+trap encerrar EXIT INT TERM
+for exe in aws jq; do command -v "$exe" >/dev/null || { log "Comando ausente: $exe"; exit 1; }; done
+test "$(aws sts get-caller-identity --query Account --output text)" = CONTA_AWS
+for id in "${IDS[@]}"; do
+  estado=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "$id" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)
+  log "$id: $estado"
+  test "$estado" = stopped || { log 'ABORTADO: EC2 nao estava desligada.'; exit 1; }
+done
+enviar(){
+  local id="$1" script="$2" payload
+  payload=$(jq -nc --arg cmd "$script" '{commands:[$cmd],executionTimeout:["1200"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript \
+    --instance-ids "$id" --parameters "$payload" --query Command.CommandId --output text
+}
+aguardar(){
+  local id="$1" comando="$2" estado=''
+  for _ in $(seq 1 180); do
+    (( $(date +%s) < TEMPO_FINAL )) || { log 'Limite seguro de tempo atingido.'; return 1; }
+    estado=$(aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+      --command-id "$comando" --query Status --output text 2>/dev/null || true)
+    case "$estado" in Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable) break;; esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" --instance-id "$id" \
+    --command-id "$comando" \
+    --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json || true
+  [[ "$estado" = Success ]]
+}
+rodar(){ local id="$1" cmd; cmd=$(enviar "$id" "$2"); aguardar "$id" "$cmd"; }
+substituir(){ local s="$1" chave="$2" valor="$3"; printf '%s' "${s//__${chave}__/$valor}"; }
+parametrizar(){
+  local texto="$1" item
+  for item in "ENGINE=$2" "RUN=$RUN" "TOPICO=$TOPICO" "SAIDA=$SAIDA" "STREAM=$STREAM" "PREFIXO=$PREFIXO" "NUM=${3:-01}"; do
+    texto=$(substituir "$texto" "${item%%=*}" "${item#*=}")
+  done
+  printf '%s' "$texto"
+}
+
+log 'Iniciando EC2-01, EC2-02 e EC2-05 para testar SOMENTE Arroyo e Kinesis.'
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+LIGOU=1
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+online=0
+for _ in $(seq 1 45); do
+  ativos=" $(aws ssm describe-instance-information --region "$REGIAO" \
+    --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' \
+    --output text | tr '\t' ' ') "
+  online=1
+  for id in "${IDS[@]}"; do [[ "$ativos" = *" $id "* ]] || online=0; done
+  (( online )) && break
+  sleep 10
+done
+(( online )) || { log 'SSM offline; abortando.'; exit 1; }
+for id in "${IDS[@]}"; do
+  rodar "$id" $'#!/bin/bash\nset -e\nshutdown -h +55\necho PARADA_DE_SEGURANCA_55_MIN' || exit 1
+done
+
+PREPARAR_FLINK=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+RUN=__RUN__
+TOPICO=__TOPICO__
+BASE="/tmp/tcc2-falhas-$RUN-flink-motor"
+DIR=/opt/tcc2/complementos/AWS/Preparacao
+mkdir -p "$BASE"
+cd "$DIR"
+test -f .env
+test -s Flink/connectors/flink-sql-connector-kafka-3.4.0-1.20.jar
+test -s Flink/connectors/flink-connector-jdbc-3.4.0-1.20.jar
+test -s Flink/connectors/postgresql-42.7.4.jar
+docker stop materialize-tcc risingwave-tcc arroyo-tcc >/dev/null 2>&1 || true
+docker compose --env-file .env -f docker-compose-flink-kafka.yml up -d kafka postgres jobmanager taskmanager
+for n in $(seq 1 80); do
+  docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1 && \
+  docker exec postgres-resultados-tcc pg_isready -U tcc -d tcc >/dev/null 2>&1 && break
+  sleep 3
+done
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+  --create --if-not-exists --topic "$TOPICO" --partitions 3 --replication-factor 1
+TABELA="resumo_frota_falhas_${RUN}"
+POSICAO="posicao_atual_falhas_${RUN}"
+docker exec postgres-resultados-tcc psql -U tcc -d tcc -v ON_ERROR_STOP=1 \
+  -c "CREATE TABLE $TABELA (LIKE resumo_frota INCLUDING ALL); CREATE TABLE $POSICAO (LIKE posicao_atual INCLUDING ALL);"
+export BASE TOPICO TABELA POSICAO RUN
+/opt/tcc2/venv/bin/python - <<'PY'
+import os
+from pathlib import Path
+p=Path(os.environ['BASE'])/'pipeline.sql'
+senha=next(x.split('=',1)[1].strip() for x in Path('/opt/tcc2/complementos/AWS/Preparacao/.env').read_text().splitlines() if x.startswith('TCC_PG_PASSWORD='))
+assert senha and "'" not in senha
+q="""
+CREATE TABLE eventos_falhas (
+  id_evento BIGINT, veiculo_id BIGINT, latitude DOUBLE, longitude DOUBLE,
+  velocidade DOUBLE, temperatura_carga DOUBLE, status_rota STRING, data_hora STRING,
+  evento_ts AS TO_TIMESTAMP(REPLACE(data_hora, 'T', ' ')),
+  WATERMARK FOR evento_ts AS evento_ts - INTERVAL '5' SECOND
+) WITH ('connector'='kafka','topic'='__TOPICO__',
+  'properties.bootstrap.servers'='kafka:29092',
+  'properties.group.id'='tcc2-falhas-__RUN__',
+  'scan.startup.mode'='earliest-offset','format'='json');
+CREATE TABLE resumo_falhas_sink (
+  status_rota STRING,total_eventos BIGINT,velocidade_media DOUBLE,
+  temperatura_media DOUBLE,PRIMARY KEY(status_rota) NOT ENFORCED
+) WITH ('connector'='jdbc','url'='jdbc:postgresql://postgres:5432/tcc',
+  'table-name'='__TABELA__','username'='tcc','password'='__SENHA__');
+CREATE TABLE posicao_falhas_sink (
+  veiculo_id BIGINT,latitude DOUBLE,longitude DOUBLE,velocidade DOUBLE,
+  temperatura_carga DOUBLE,status_rota STRING,data_hora TIMESTAMP(3),
+  PRIMARY KEY(veiculo_id) NOT ENFORCED
+) WITH ('connector'='jdbc','url'='jdbc:postgresql://postgres:5432/tcc',
+  'table-name'='__POSICAO__','username'='tcc','password'='__SENHA__');
+EXECUTE STATEMENT SET BEGIN
+  INSERT INTO resumo_falhas_sink
+    SELECT status_rota,COUNT(*),AVG(velocidade),AVG(temperatura_carga)
+    FROM eventos_falhas GROUP BY status_rota;
+  INSERT INTO posicao_falhas_sink
+    SELECT veiculo_id,latitude,longitude,velocidade,temperatura_carga,status_rota,evento_ts
+    FROM (SELECT *,ROW_NUMBER() OVER (PARTITION BY veiculo_id ORDER BY evento_ts DESC) rn
+          FROM eventos_falhas) WHERE rn=1;
+END;
+"""
+for k,v in {'TOPICO':os.environ['TOPICO'],'TABELA':os.environ['TABELA'],
+            'POSICAO':os.environ['POSICAO'],'RUN':os.environ['RUN'],'SENHA':senha}.items():
+ q=q.replace('__'+k+'__',v)
+p.write_text(q)
+PY
+docker cp "$BASE/pipeline.sql" flink-jobmanager-tcc:/tmp/tcc2_falhas_pipeline.sql
+timeout 180 docker exec flink-jobmanager-tcc /opt/flink/bin/sql-client.sh \
+  -f /tmp/tcc2_falhas_pipeline.sql > "$BASE/flink_sql.log" 2>&1 || {
+  tail -n 60 "$BASE/flink_sql.log"; exit 1;
+}
+echo "FLINK_FALHAS_PRONTO topico=$TOPICO tabela=$TABELA"
+REMOTO
+)
+
+PREPARAR_ARROYO=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+RUN=__RUN__
+TOPICO=__TOPICO__
+SAIDA=__SAIDA__
+BASE="/tmp/tcc2-falhas-$RUN-arroyo-motor"
+DIR=/opt/tcc2/complementos/AWS/Preparacao
+mkdir -p "$BASE"
+cd "$DIR"
+test -s SQL/arroyo_pipeline.sql
+docker stop flink-jobmanager-tcc flink-taskmanager-tcc >/dev/null 2>&1 || true
+docker compose --env-file .env -f docker-compose-flink-kafka.yml up -d kafka
+for i in $(seq 1 60); do
+  docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 --list >/dev/null 2>&1 && break
+  sleep 3
+done
+for topico in "$TOPICO" "$SAIDA"; do
+  docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:29092 \
+    --create --if-not-exists --topic "$topico" --partitions 3 --replication-factor 1
+done
+export BASE TOPICO SAIDA DIR
+python3 - <<'PY'
+from pathlib import Path
+import os
+original=(Path(os.environ['DIR'])/'SQL/arroyo_pipeline.sql').read_text()
+assert "topic = 'eventos-transporte'" in original
+assert "topic = 'resultados-arroyo'" in original
+novo=original.replace("topic = 'eventos-transporte'", "topic = '"+os.environ['TOPICO']+"'")
+novo=novo.replace("topic = 'resultados-arroyo'", "topic = '"+os.environ['SAIDA']+"'")
+novo=novo.replace("'source.offset' = 'latest'","'source.offset' = 'earliest'")
+(Path(os.environ['BASE'])/'pipeline.sql').write_text(novo)
+PY
+NET=$(docker inspect kafka-tcc -f '{{range $n,$c := .NetworkSettings.Networks}}{{$n}}{{end}}')
+test -n "$NET"
+NOME="arroyo-falhas-$RUN"
+docker run -d --name "$NOME" --restart no --network "$NET" \
+  --mount "type=bind,src=$BASE/pipeline.sql,dst=/tmp/pipeline.sql,readonly" \
+  ghcr.io/arroyosystems/arroyo:latest run -p 2 /tmp/pipeline.sql >/dev/null
+sleep 12
+if test "$(docker inspect -f '{{.State.Running}}' "$NOME")" != true; then
+  docker logs --tail 100 "$NOME"; exit 1
+fi
+echo "ARROYO_FALHAS_PRONTO topico=$TOPICO saida=$SAIDA"
+REMOTO
+)
+
+PREPARAR_KINESIS=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+RUN=__RUN__
+STREAM=__STREAM__
+BASE="/tmp/tcc2-falhas-$RUN-kinesis-motor"
+mkdir -p "$BASE"
+test -s /opt/tcc2/codigo/AWS/Preparacao/Kinesis/kinesis_consumidor.py
+cp /opt/tcc2/codigo/AWS/Preparacao/Kinesis/kinesis_consumidor.py "$BASE/consumidor.py"
+if test -s /tmp/tcc2-auto-consumer.pid; then
+  ANTIGO=$(cat /tmp/tcc2-auto-consumer.pid)
+  if [[ "$ANTIGO" =~ ^[0-9]+$ ]] && ps -p "$ANTIGO" -o args= | grep -q '/consumidor.py'; then
+    kill "$ANTIGO" || true
+    sleep 3
+  fi
+fi
+nohup /opt/tcc2/venv/bin/python "$BASE/consumidor.py" --stream "$STREAM" \
+  --region us-east-1 --host 127.0.0.1 --port 8766 \
+  > "$BASE/consumidor.log" 2>&1 </dev/null &
+echo "$!" > "$BASE/consumidor.pid"
+for i in $(seq 1 35); do
+  curl -fsS http://127.0.0.1:8766/health > "$BASE/health.json" 2>/dev/null && break
+  sleep 1
+done
+test -s "$BASE/health.json"
+grep -q '"erro": null' "$BASE/health.json" || { cat "$BASE/health.json"; exit 1; }
+echo "KINESIS_CONSUMIDOR_PRONTO stream=$STREAM"
+REMOTO
+)
+
+MONITOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+BASE="/tmp/tcc2-falhas-$RUN-$ENGINE-motor"
+mkdir -p "$BASE"
+printf 'utc,load_1m,mem_total_kb,mem_available_kb,docker_cpu_mem\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+ while test -f "$1/monitorar"; do
+  load=$(cut -d" " -f1 /proc/loadavg)
+  total=$(awk "/MemTotal:/{print \$2}" /proc/meminfo)
+  livre=$(awk "/MemAvailable:/{print \$2}" /proc/meminfo)
+  stats=$(docker stats --no-stream --format "{{.Name}}={{.CPUPerc}}/{{.MemUsage}}" 2>/dev/null | tr "\n" ";" || true)
+  printf "%s,%s,%s,%s,\"%s\"\n" "$(date -u +%FT%TZ)" "$load" "$total" "$livre" "$stats" >> "$1/metricas.csv"
+  sleep 3
+ done
+' bash "$BASE" >/dev/null 2>&1 </dev/null &
+echo MONITOR_INICIADO
+REMOTO
+)
+
+PRODUTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+NUM=__NUM__
+RUN=__RUN__
+TOPICO=__TOPICO__
+STREAM=__STREAM__
+PREFIXO=__PREFIXO__
+BASE="/tmp/tcc2-falhas-$RUN-$ENGINE-EC2-$NUM"
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_10000.csv"
+mkdir -p "$BASE"
+test -s "$CSV"
+test "$(( $(wc -l < "$CSV") - 1 ))" -eq 5000
+export ENGINE NUM RUN TOPICO STREAM PREFIXO BASE CSV
+python3 - <<'PY'
+import os
+from pathlib import Path
+import xml.etree.ElementTree as ET
+engine=os.environ['ENGINE']
+arquivos={'flink':'Plano de TesteFlink_Kafka.jmx',
+          'arroyo':'Plano_Arroyo_Kafka.jmx',
+          'kinesis':'Plano de TesteRisingWave.jmx'}
+arvore=ET.parse(Path('/opt/tcc2/clientes/JMeter/planos')/arquivos[engine]); root=arvore.getroot()
+for coletor in root.iter('ResultCollector'):
+ coletor.set('enabled','false')
+ nome=coletor.find("stringProp[@name='filename']")
+ if nome is not None:nome.text=''
+if engine!='kinesis':
+ mudados=0
+ for s in root.iter('stringProp'):
+  if s.text and '"eventos-transporte"' in s.text:
+   s.text=s.text.replace('"eventos-transporte"','"'+os.environ['TOPICO']+'"')
+   mudados+=1
+ assert mudados==1, 'Topico Kafka nao foi isolado no plano JMeter'
+else:
+ for e in root.iter():
+  if e.tag in ('JDBCSampler','JDBCDataSource','DebugSampler'):e.set('enabled','false')
+  if e.tag=='HTTPSamplerProxy':
+   e.set('enabled','true')
+   for prop,val in [('HTTPSampler.domain','127.0.0.1'),('HTTPSampler.port','8765'),('HTTPSampler.path','/evento')]:
+    alvo=e.find("stringProp[@name='"+prop+"']")
+    if alvo is not None:alvo.text=val
+timer=ET.Element('ConstantTimer',{'guiclass':'ConstantTimerGui','testclass':'ConstantTimer','testname':'Pausa 60 ms','enabled':'true'})
+ET.SubElement(timer,'stringProp',{'name':'ConstantTimer.delay'}).text='60'
+grupos=0
+for pai in root.iter():
+ filhos=list(pai)
+ for i,filho in enumerate(filhos):
+  if filho.tag=='ThreadGroup':
+   assert i+1<len(filhos) and filhos[i+1].tag=='hashTree'
+   filhos[i+1].insert(0,timer);filhos[i+1].insert(1,ET.Element('hashTree'))
+   grupos+=1
+assert grupos==1
+arvore.write(Path(os.environ['BASE'])/'plano.jmx',encoding='utf-8',xml_declaration=True)
+PY
+if [[ "$ENGINE" = kinesis ]]; then
+  CODIGO=/opt/tcc2/codigo/AWS/Preparacao/Kinesis/kinesis_produtor.py
+  test -s "$CODIGO"
+  nohup /opt/tcc2/venv/bin/python "$CODIGO" --stream "$STREAM" \
+    --region us-east-1 --port 8765 > "$BASE/produtor.log" 2>&1 </dev/null &
+  echo "$!" > "$BASE/produtor.pid"
+  for i in $(seq 1 30); do
+    curl -fsS http://127.0.0.1:8765/health >/dev/null 2>&1 && break
+    sleep 1
+  done
+  curl -fsS http://127.0.0.1:8765/health >/dev/null
+fi
+set +e
+timeout 650 /usr/local/bin/jmeter -n -t "$BASE/plano.jmx" \
+  -Jthreads=5 -Jloops=1000 -Jcsvfile="$CSV" \
+  -Jkafkaserver=IP_EXEMPLO:9092 \
+  -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" \
+  > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+export RC
+/opt/tcc2/venv/bin/python - <<'PY'
+import os,csv,json,boto3
+from pathlib import Path
+p=Path(os.environ['BASE']); n=erros=0
+if (p/'resultado.jtl').is_file():
+ with (p/'resultado.jtl').open(encoding='utf-8',newline='') as f:
+  for x in csv.DictReader(f):
+   n+=1; erros+=x.get('success','').lower()!='true'
+info={'engine':os.environ['ENGINE'],'volume':10000,'ec2':os.environ['NUM'],
+      'threads':5,'amostras':n,'esperado':5000,'erros':erros,
+      'jmeter_exit':int(os.environ['RC']),'falha_planejada':'interrupcao_8s'}
+(p/'resumo.json').write_text(json.dumps(info,indent=2))
+s3=boto3.client('s3',region_name='us-east-1')
+dest=os.environ['PREFIXO']+'/'+os.environ['ENGINE']+'/EC2-'+os.environ['NUM']+'/'
+for a in p.iterdir():
+ if a.is_file() and a.name!='produtor.pid':
+  s3.upload_file(str(a),'tcc2-pacotes-CONTA_AWS-us-east-1',dest+a.name,
+                 ExtraArgs={'ServerSideEncryption':'AES256'})
+print('JMETER_FALHA:',info,flush=True)
+assert int(os.environ['RC'])==0 and n==5000, 'Execucao incompleta; arquivos salvos no S3'
+PY
+REMOTO
+)
+
+INJETAR=$(cat <<'REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+STREAM=__STREAM__
+TOPICO=__TOPICO__
+BASE="/tmp/tcc2-falhas-$RUN-$ENGINE-motor"
+OBSERVADO=0
+for n in $(seq 1 65); do
+  if [[ "$ENGINE" = kinesis ]]; then
+    OBSERVADO=$(BASE="$BASE" /opt/tcc2/venv/bin/python - <<'PY'
+import os,sqlite3
+from pathlib import Path
+p=Path(os.environ['BASE'])/'resultados_kinesis.sqlite'
+if not p.is_file():
+ print(0)
+else:
+ try:
+  db=sqlite3.connect(str(p),timeout=2)
+  print(db.execute('SELECT COUNT(*) FROM eventos').fetchone()[0])
+ except sqlite3.Error:
+  print(0)
+PY
+    )
+  else
+    OBSERVADO=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+      --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 \
+      | awk -F: '{s+=$3} END{print s+0}')
+  fi
+  if (( OBSERVADO >= 300 && OBSERVADO < 9000 )); then break; fi
+  sleep 2
+done
+if (( OBSERVADO < 300 || OBSERVADO >= 9000 )); then
+  echo "FALHA_NAO_INJETADA: carga fora da janela; observados=$OBSERVADO" >&2
+  exit 1
+fi
+sleep 2
+INICIO=$(date -u +%FT%T.%NZ)
+case "$ENGINE" in
+ flink)
+   docker stop flink-taskmanager-tcc >/dev/null
+   sleep 8
+   docker start flink-taskmanager-tcc >/dev/null
+   COMPONENTE=flink-taskmanager-tcc
+   TIPO='docker stop/start (taskmanager)'
+   ;;
+ arroyo)
+   COMPONENTE="arroyo-falhas-$RUN"
+   docker pause "$COMPONENTE" >/dev/null
+   sleep 8
+   docker unpause "$COMPONENTE" >/dev/null
+   TIPO='docker pause/unpause'
+   ;;
+ kinesis)
+   COMPONENTE=consumidor-kinesis
+   PID=$(cat "$BASE/consumidor.pid")
+   test -n "$PID"
+   ps -p "$PID" -o args= | grep -q '/consumidor.py'
+   kill "$PID"
+   for i in $(seq 1 20); do
+     kill -0 "$PID" >/dev/null 2>&1 || break
+     sleep 0.2
+   done
+   sleep 8
+   nohup /opt/tcc2/venv/bin/python "$BASE/consumidor.py" \
+     --stream "$STREAM" --region us-east-1 --host 127.0.0.1 --port 8766 \
+     >> "$BASE/consumidor.log" 2>&1 </dev/null &
+   echo "$!" > "$BASE/consumidor.pid"
+   for i in $(seq 1 35); do
+     curl -fsS http://127.0.0.1:8766/health > "$BASE/health_reinicio.json" 2>/dev/null && break
+     sleep 1
+   done
+   grep -q '"erro": null' "$BASE/health_reinicio.json"
+   TIPO='interrupcao/reinicio do consumidor'
+   ;;
+esac
+FIM=$(date -u +%FT%T.%NZ)
+export ENGINE RUN BASE INICIO FIM COMPONENTE TIPO OBSERVADO
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,os,json
+from pathlib import Path
+p=Path(os.environ['BASE'])
+info={'engine':os.environ['ENGINE'],'componente':os.environ['COMPONENTE'],
+      'tipo':os.environ['TIPO'],'inicio_utc':os.environ['INICIO'],
+      'fim_utc':os.environ['FIM'],'duracao_planejada_segundos':8,
+      'eventos_entrada_antes_da_falha':int(os.environ['OBSERVADO'])}
+(p/'falha.json').write_text(json.dumps(info,indent=2))
+boto3.client('s3',region_name='us-east-1').upload_file(
+ str(p/'falha.json'),'tcc2-pacotes-CONTA_AWS-us-east-1',
+ 'resultados/falhas/streams/'+os.environ['RUN']+'/'+os.environ['ENGINE']+'/motor/falha.json',
+ ExtraArgs={'ServerSideEncryption':'AES256'})
+print('FALHA_INJETADA:',info,flush=True)
+PY
+REMOTO
+)
+
+FINAL=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+ENGINE=__ENGINE__
+RUN=__RUN__
+TOPICO=__TOPICO__
+SAIDA=__SAIDA__
+BASE="/tmp/tcc2-falhas-$RUN-$ENGINE-motor"
+rm -f "$BASE/monitorar"
+sleep 5
+export ENGINE RUN BASE TOPICO SAIDA
+if [[ "$ENGINE" = flink || "$ENGINE" = arroyo ]]; then
+  ENTRADA=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 \
+    | awk -F: '{s+=$3} END{print s+0}')
+  if [[ "$ENGINE" = flink ]]; then
+    for i in $(seq 1 55); do
+      PROCESSADOS=$(docker exec postgres-resultados-tcc psql -U tcc -d tcc -t -A \
+        -c "SELECT COALESCE(SUM(total_eventos),0) FROM resumo_frota_falhas_${RUN};")
+      [[ "$PROCESSADOS" = "$ENTRADA" ]] && break
+      sleep 3
+    done
+  else
+    PROCESSADOS=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+      --bootstrap-server kafka:29092 --topic "$SAIDA" --time -1 \
+      | awk -F: '{s+=$3} END{print s+0}')
+  fi
+else
+  for i in $(seq 1 60); do
+    ENTRADA=$(BASE="$BASE" /opt/tcc2/venv/bin/python - <<'PY'
+import os,sqlite3
+p=os.path.join(os.environ['BASE'],'resultados_kinesis.sqlite')
+d=sqlite3.connect(p)
+print(d.execute('SELECT COUNT(*) FROM eventos').fetchone()[0])
+PY
+    )
+    [[ "$ENTRADA" = 10000 ]] && break
+    sleep 3
+  done
+  PROCESSADOS="$ENTRADA"
+fi
+export ENTRADA PROCESSADOS
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3,os,json
+from pathlib import Path
+engine=os.environ['ENGINE']; p=Path(os.environ['BASE'])
+entrada=int(os.environ['ENTRADA']);processados=int(os.environ['PROCESSADOS'])
+tipo={'flink':'entrada_kafka_e_sink_sql_agregado',
+      'arroyo':'entrada_kafka_e_mensagens_janelas_na_saida',
+      'kinesis':'ids_unicos_sqlite_consumidor'}[engine]
+info={'engine':engine,'esperado':10000,'registros_entrada':entrada,
+      'saida_observada':processados,'tipo_auditoria':tipo,
+      'diferenca_entrada':10000-entrada,
+      'observacao':('O Arroyo emite resultados agregados por janela; mensagens de saida nao equivalem a eventos individuais.'
+      if engine=='arroyo' else 'Esta auditoria usa agregados/contagens; consulte o JTL para tempos e interrupcao.')}
+if engine=='flink':info['diferenca_sink']=10000-processados
+if engine=='kinesis':info['ids_distintos_consumidor']=processados
+(p/'consistencia.json').write_text(json.dumps(info,indent=2,ensure_ascii=False))
+s3=boto3.client('s3',region_name='us-east-1')
+dest='resultados/falhas/streams/'+os.environ['RUN']+'/'+engine+'/motor/'
+for a in p.iterdir():
+ if a.is_file() and a.name not in ('pipeline.sql','consumidor.py','consumidor.pid'):
+  s3.upload_file(str(a),'tcc2-pacotes-CONTA_AWS-us-east-1',dest+a.name,
+                 ExtraArgs={'ServerSideEncryption':'AES256'})
+print('CONSISTENCIA_POS_FALHA:',info,flush=True)
+assert entrada==10000, 'Eventos de entrada incompletos; veja arquivos no S3'
+if engine=='flink': assert processados==10000, 'Sink Flink incompleto; veja S3'
+if engine=='kinesis':assert processados==10000, 'Kinesis consumidor incompleto; veja S3'
+PY
+REMOTO
+)
+
+for engine in arroyo kinesis; do
+  log "========== $engine: teste de falha com 10.000 eventos =========="
+  if [[ "$engine" = kinesis ]]; then
+    STREAM_CRIADO=1
+    aws kinesis create-stream --region "$REGIAO" --stream-name "$STREAM" --shard-count 2
+    for _ in $(seq 1 50); do
+      estado=$(aws kinesis describe-stream-summary --region "$REGIAO" --stream-name "$STREAM" \
+        --query StreamDescriptionSummary.StreamStatus --output text 2>/dev/null || true)
+      [[ "$estado" = ACTIVE ]] && break
+      sleep 5
+    done
+    [[ "$estado" = ACTIVE ]] || { log 'Stream Kinesis nao ficou ativo'; exit 1; }
+  fi
+  case "$engine" in
+    flink) preparar="$PREPARAR_FLINK";;
+    arroyo) preparar="$PREPARAR_ARROYO";;
+    kinesis) preparar="$PREPARAR_KINESIS";;
+  esac
+  rodar "$MOTOR" "$(parametrizar "$preparar" "$engine")" || { log "Preparacao $engine falhou"; exit 1; }
+  rodar "$MOTOR" "$(parametrizar "$MONITOR" "$engine")" || exit 1
+  jobs=()
+  for num in 01 02; do
+    id="$P1"; [[ "$num" = 02 ]] && id="$P2"
+    jobs+=("$id:$(enviar "$id" "$(parametrizar "$PRODUTOR" "$engine" "$num")")")
+  done
+  if ! rodar "$MOTOR" "$(parametrizar "$INJETAR" "$engine")"; then
+    INCIDENTES=$((INCIDENTES+1))
+    log "Erro de execucao ao injetar falha em $engine; evidencias preservadas."
+  fi
+  for job in "${jobs[@]}"; do
+    if ! aguardar "${job%%:*}" "${job#*:}"; then
+      INCIDENTES=$((INCIDENTES+1))
+      log "JMeter ${job%%:*} concluiu com erro; verificar S3."
+    fi
+  done
+  if ! rodar "$MOTOR" "$(parametrizar "$FINAL" "$engine")"; then
+    INCIDENTES=$((INCIDENTES+1))
+    log "Auditoria pos-falha $engine nao fechou; S3 preservado."
+  fi
+  log "Fim de $engine."
+done
+log 'Testes Arroyo e Kinesis encerrados; Flink e baselines NAO repetidos.'
+if (( INCIDENTES > 0 )); then exit 1; fi

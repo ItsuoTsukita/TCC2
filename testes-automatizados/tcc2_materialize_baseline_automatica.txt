@@ -1,0 +1,269 @@
+Executa as cargas de referência do Materialize.
+
+bash <<'TCC2_MATERIALIZE_BASELINE'
+set -euo pipefail
+REGIAO='us-east-1'
+BUCKET='tcc2-pacotes-CONTA_AWS-us-east-1'
+P1='i-EXEMPLO'
+P2='i-EXEMPLO'
+MOTOR='i-EXEMPLO'
+IDS=("$P1" "$P2" "$MOTOR")
+RUN="$(date -u +%Y%m%d_%H%M%S)"
+PASTA_S3="resultados/baseline/materialize/$RUN"
+LIMITE=$(( $(date +%s) + 3300 ))
+
+echo '=== CONFERINDO INSTANCIAS SEM INICIAR COBRANCA ==='
+for ID in "${IDS[@]}"; do
+  ESTADO=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "$ID" \
+    --query 'Reservations[0].Instances[0].State.Name' --output text)
+  echo "$ID: $ESTADO"
+  test "$ESTADO" = stopped || { echo 'ABORTADO: EC2 nao esta desligada.'; exit 1; }
+done
+
+finalizar() {
+  trap - EXIT INT TERM
+  echo '=== PARANDO AS TRES EC2 ==='
+  aws ec2 stop-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null || true
+  if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "${IDS[@]}"; then
+    echo 'EC2-01, EC2-02 E EC2-05 CONFIRMADAS DESLIGADAS'
+  else
+    echo 'ATENCAO: parada nao confirmada. Confira imediatamente o console EC2.'
+  fi
+}
+trap finalizar EXIT INT TERM
+
+enviar() {
+  local id="$1" script="$2" json
+  json=$(jq -nc --arg comando "$script" '{commands:[$comando],executionTimeout:["3300"]}')
+  aws ssm send-command --region "$REGIAO" --document-name AWS-RunShellScript \
+    --instance-ids "$id" --parameters "$json" \
+    --query 'Command.CommandId' --output text
+}
+
+aguardar() {
+  local id="$1" comando="$2" estado='' tentativa
+  for tentativa in $(seq 1 660); do
+    if (( $(date +%s) >= LIMITE )); then
+      echo "LIMITE DE TEMPO ESGOTADO: $id $comando"
+      return 1
+    fi
+    estado=$(aws ssm get-command-invocation --region "$REGIAO" \
+      --instance-id "$id" --command-id "$comando" \
+      --query Status --output text 2>/dev/null || true)
+    case "$estado" in
+      Success|Failed|Cancelled|TimedOut|DeliveryTimedOut|Undeliverable|Terminated) break;;
+    esac
+    sleep 5
+  done
+  aws ssm get-command-invocation --region "$REGIAO" \
+    --instance-id "$id" --command-id "$comando" \
+    --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json
+  test "$estado" = Success
+}
+
+echo '=== INICIANDO EC2-01, EC2-02 E EC2-05 ==='
+aws ec2 start-instances --region "$REGIAO" --instance-ids "${IDS[@]}" >/dev/null
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "${IDS[@]}"
+SSM_ONLINE=0
+for TENTATIVA in $(seq 1 40); do
+  ATIVAS=$(aws ssm describe-instance-information --region "$REGIAO" \
+    --query 'InstanceInformationList[?PingStatus==`Online`].InstanceId' --output text)
+  SSM_ONLINE=1
+  for ID in "${IDS[@]}"; do
+    [[ " ${ATIVAS//$'\t'/ } " == *" $ID "* ]] || SSM_ONLINE=0
+  done
+  test "$SSM_ONLINE" -eq 1 && break
+  sleep 10
+done
+test "$SSM_ONLINE" -eq 1 || { echo 'SSM OFFLINE, DESLIGANDO'; exit 1; }
+echo 'SSM ONLINE NAS TRES EC2'
+
+echo '=== CONFIGURANDO DESLIGAMENTO DE SEGURANCA ==='
+COMANDOS=()
+for ID in "${IDS[@]}"; do
+  COMANDOS+=("$(enviar "$ID" $'#!/bin/bash\nset -e\nshutdown -h +55\necho DESLIGAMENTO_DE_SEGURANCA_AGENDADO')")
+done
+for I in 0 1 2; do aguardar "${IDS[$I]}" "${COMANDOS[$I]}"; done
+
+echo '=== INICIANDO MATERIALIZE ==='
+MOTOR_INICIAL=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+docker start materialize-tcc >/dev/null || true
+for T in $(seq 1 60); do
+  if docker exec materialize-tcc psql -h localhost -p 6875 -U materialize \
+    -d materialize -c 'SELECT 1;' >/dev/null 2>&1; then
+    echo 'MATERIALIZE ONLINE'
+    exit 0
+  fi
+  sleep 5
+done
+echo 'MATERIALIZE INDISPONIVEL'
+exit 1
+REMOTO
+)
+aguardar "$MOTOR" "$(enviar "$MOTOR" "$MOTOR_INICIAL")"
+
+for VOLUME in 10000 100000 500000; do
+  if (( $(date +%s) >= LIMITE )); then echo 'LIMITE DE TEMPO ESGOTADO'; exit 1; fi
+  echo "=== PREPARANDO $VOLUME EVENTOS ==="
+  MOTOR_PREPARO=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+VOLUME=__VOLUME__
+RUN='__RUN__'
+BASE="/tmp/tcc2-mz-$RUN-$VOLUME"
+mkdir -p "$BASE"
+docker exec materialize-tcc psql -h localhost -p 6875 -U materialize \
+  -d materialize -v ON_ERROR_STOP=1 \
+  -c 'DROP TABLE IF EXISTS eventos_transporte CASCADE;'
+docker exec -i materialize-tcc psql -h localhost -p 6875 -U materialize \
+  -d materialize -v ON_ERROR_STOP=1 \
+  < /opt/tcc2/complementos/AWS/Preparacao/SQL/materialize_criar_tabela.sql
+TOTAL=$(docker exec materialize-tcc psql -h localhost -p 6875 -U materialize \
+  -d materialize -t -A -c 'SELECT COUNT(*) FROM eventos_transporte;' | tr -d '[:space:]')
+test "$TOTAL" = 0
+printf 'timestamp_utc,cpu_pct,mem_usage\n' > "$BASE/metricas.csv"
+touch "$BASE/monitorar"
+nohup bash -c '
+  while [ -f "$1/monitorar" ]; do
+    LINHA=$(docker stats --no-stream --format "{{.CPUPerc}},{{.MemUsage}}" materialize-tcc 2>/dev/null || true)
+    [ -n "$LINHA" ] && printf "%s,%s\n" "$(date -u +%FT%TZ)" "${LINHA//, /|}"
+    sleep 3
+  done
+' bash "$BASE" >> "$BASE/metricas.csv" 2>/dev/null </dev/null &
+echo "MOTOR_PREPARADO: $VOLUME; METRICAS_INICIADAS"
+REMOTO
+)
+  MOTOR_PREPARO="${MOTOR_PREPARO//__VOLUME__/$VOLUME}"
+  MOTOR_PREPARO="${MOTOR_PREPARO//__RUN__/$RUN}"
+  aguardar "$MOTOR" "$(enviar "$MOTOR" "$MOTOR_PREPARO")"
+
+  echo "=== EXECUTANDO JMETER EM PARALELO: $VOLUME EVENTOS, 5 THREADS POR EC2 ==="
+  declare -A JOBS=()
+  for NUM in 01 02; do
+    if [ "$NUM" = 01 ]; then ID="$P1"; else ID="$P2"; fi
+    PRODUTOR=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+VOLUME=__VOLUME__
+NUM='__NUM__'
+RUN='__RUN__'
+THREADS=5
+RUN_S3='__RUN__'
+BASE="/tmp/tcc2-mz-$RUN-$VOLUME-ec2-$NUM"
+CSV="/opt/tcc2/clientes/MassaDeDados/EC2-$NUM/eventos_$VOLUME.csv"
+mkdir -p "$BASE"
+export BASE VOLUME NUM THREADS RUN_S3
+test -s "$CSV"
+LINHAS=$(( $(wc -l < "$CSV") - 1 ))
+test "$LINHAS" -eq "$(( VOLUME / 2 ))"
+test "$(( LINHAS % THREADS ))" -eq 0
+LOOPS=$(( LINHAS / THREADS ))
+python3 - <<'JMX'
+from pathlib import Path
+import os
+import xml.etree.ElementTree as ET
+origem = Path('/opt/tcc2/clientes/JMeter/planos/Plano de TesteMaterialize.jmx')
+destino = Path(os.environ['BASE']) / 'plano.jmx'
+arvore = ET.parse(origem)
+for coletor in arvore.getroot().iter('ResultCollector'):
+    coletor.set('enabled', 'false')
+    arquivo = coletor.find("stringProp[@name='filename']")
+    if arquivo is not None:
+        arquivo.text = ''
+arvore.write(destino, encoding='utf-8', xml_declaration=True)
+JMX
+set +e
+/usr/local/bin/jmeter -n -t "$BASE/plano.jmx" \
+  -Jthreads="$THREADS" -Jloops="$LOOPS" -Jcsvfile="$CSV" \
+  -Jdbhost=IP_EXEMPLO -Jdbport=6875 \
+  -l "$BASE/resultado.jtl" -j "$BASE/jmeter.log" > "$BASE/console.log" 2>&1
+RC=$?
+set -e
+export RC
+/opt/tcc2/venv/bin/python - <<'RESULTADOS'
+from pathlib import Path
+import boto3, csv, json, os
+base = Path(os.environ['BASE'])
+volume = int(os.environ['VOLUME'])
+esperado = volume // 2
+total = erros = 0
+arquivo = base / 'resultado.jtl'
+if arquivo.is_file():
+    with arquivo.open(encoding='utf-8', newline='') as f:
+        for linha in csv.DictReader(f):
+            total += 1
+            erros += linha.get('success', '').lower() != 'true'
+info = {'volume_global': volume, 'ec2': os.environ['NUM'], 'threads': int(os.environ['THREADS']),
+        'esperado': esperado, 'amostras': total, 'erros': erros, 'jmeter_exit': int(os.environ['RC'])}
+(base / 'resumo.json').write_text(json.dumps(info, indent=2), encoding='utf-8')
+s3 = boto3.client('s3', region_name='us-east-1')
+prefixo = 'resultados/baseline/materialize/' + os.environ['RUN_S3'] + '/' + str(volume) + '/EC2-' + os.environ['NUM'] + '/'
+for nome in ['resultado.jtl', 'jmeter.log', 'console.log', 'resumo.json']:
+    caminho = base / nome
+    if caminho.is_file():
+        s3.upload_file(str(caminho), 'tcc2-pacotes-CONTA_AWS-us-east-1', prefixo + nome,
+                       ExtraArgs={'ServerSideEncryption': 'AES256'})
+print('JMETER:', info, flush=True)
+assert int(os.environ['RC']) == 0 and total == esperado and erros == 0, 'JMeter apresentou falhas; resultados salvos no S3'
+RESULTADOS
+REMOTO
+)
+    PRODUTOR="${PRODUTOR//__VOLUME__/$VOLUME}"
+    PRODUTOR="${PRODUTOR//__NUM__/$NUM}"
+    PRODUTOR="${PRODUTOR//__RUN__/$RUN}"
+    JOBS["$ID"]="$(enviar "$ID" "$PRODUTOR")"
+    echo "EC2-$NUM iniciou: ${JOBS[$ID]}"
+  done
+
+  ERRO=0
+  for ID in "$P1" "$P2"; do
+    if ! aguardar "$ID" "${JOBS[$ID]}"; then ERRO=1; fi
+  done
+
+  echo "=== VALIDANDO CONSISTENCIA E METRICAS: $VOLUME ==="
+  MOTOR_FINAL=$(cat <<'REMOTO'
+#!/bin/bash
+set -euo pipefail
+VOLUME=__VOLUME__
+RUN='__RUN__'
+BASE="/tmp/tcc2-mz-$RUN-$VOLUME"
+test -f "$BASE/monitorar"
+rm "$BASE/monitorar"
+sleep 5
+LINHA=$(docker exec materialize-tcc psql -h localhost -p 6875 -U materialize \
+  -d materialize -t -A -F '|' \
+  -c 'SELECT COUNT(*),COUNT(DISTINCT id_evento) FROM eventos_transporte;' | tail -1)
+echo "TOTAL_E_DISTINTOS=$LINHA"
+export LINHA VOLUME RUN BASE
+/opt/tcc2/venv/bin/python - <<'SALVAR'
+import boto3, json, os
+from pathlib import Path
+total, distintos = map(int, os.environ['LINHA'].split('|'))
+volume = int(os.environ['VOLUME'])
+base = Path(os.environ['BASE'])
+info = {'volume_esperado': volume, 'registros': total, 'distintos': distintos,
+        'perdidos': volume - total, 'duplicados': total - distintos}
+(base / 'consistencia.json').write_text(json.dumps(info, indent=2), encoding='utf-8')
+s3 = boto3.client('s3', region_name='us-east-1')
+prefixo = 'resultados/baseline/materialize/' + os.environ['RUN'] + '/' + str(volume) + '/motor/'
+for nome in ['metricas.csv', 'consistencia.json']:
+    s3.upload_file(str(base / nome), 'tcc2-pacotes-CONTA_AWS-us-east-1', prefixo + nome,
+                   ExtraArgs={'ServerSideEncryption': 'AES256'})
+print('CONSISTENCIA:', info, flush=True)
+assert total == volume and distintos == volume, 'Inconsistencia detectada; resultados salvos no S3'
+SALVAR
+REMOTO
+)
+  MOTOR_FINAL="${MOTOR_FINAL//__VOLUME__/$VOLUME}"
+  MOTOR_FINAL="${MOTOR_FINAL//__RUN__/$RUN}"
+  if ! aguardar "$MOTOR" "$(enviar "$MOTOR" "$MOTOR_FINAL")"; then ERRO=1; fi
+  test "$ERRO" -eq 0 || { echo "FALHA NO VOLUME $VOLUME. ARQUIVOS SALVOS NO S3."; exit 1; }
+  echo "VOLUME $VOLUME VALIDADO"
+done
+
+echo '=== RESULTADOS SALVOS NO S3 ==='
+aws s3 ls "s3://$BUCKET/$PASTA_S3/" --recursive
+echo 'MATERIALIZE BASELINE COMPLETA: 10 MIL, 100 MIL, 500 MIL'
+TCC2_MATERIALIZE_BASELINE

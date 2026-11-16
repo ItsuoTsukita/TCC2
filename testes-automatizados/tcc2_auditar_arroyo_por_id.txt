@@ -1,0 +1,262 @@
+Confere a passagem dos eventos pelo Arroyo usando seus identificadores.
+
+#!/usr/bin/env bash
+set -Eeuo pipefail
+export AWS_PAGER=''
+
+REGIAO='us-east-1'
+CONTA='CONTA_AWS'
+BUCKET='tcc2-pacotes-CONTA_AWS-us-east-1'
+EC2_MOTOR='i-EXEMPLO'
+RUN="$(date -u +%Y%m%d_%H%M%S)"
+PREFIXO="resultados/validacoes/arroyo_ids/$RUN"
+LIGOU=0
+
+avisar() { printf '[%s] %s\n' "$(date -u +%FT%TZ)" "$*"; }
+finalizar() {
+  local codigo=$?
+  trap - EXIT INT TERM
+  if (( LIGOU )); then
+    avisar 'Desligando somente EC2-05.'
+    aws ec2 stop-instances --region "$REGIAO" --instance-ids "$EC2_MOTOR" >/dev/null 2>&1 || true
+    if aws ec2 wait instance-stopped --region "$REGIAO" --instance-ids "$EC2_MOTOR"; then
+      avisar 'EC2-05 confirmada desligada.'
+    else
+      avisar 'ATENCAO: confira o estado da EC2-05.'
+      codigo=1
+    fi
+  fi
+  avisar "Evidencias: s3://$BUCKET/$PREFIXO/"
+  avisar "Codigo final: $codigo"
+  exit "$codigo"
+}
+trap finalizar EXIT INT TERM
+
+for ferramenta in aws jq; do command -v "$ferramenta" >/dev/null || { avisar "Falta $ferramenta"; exit 1; }; done
+test "$(aws sts get-caller-identity --query Account --output text)" = "$CONTA"
+ESTADO=$(aws ec2 describe-instances --region "$REGIAO" --instance-ids "$EC2_MOTOR" \
+  --query 'Reservations[0].Instances[0].State.Name' --output text)
+test "$ESTADO" = stopped || { avisar "EC2-05 esta em $ESTADO. Nao vou interferir."; exit 1; }
+
+avisar 'Iniciando somente EC2-05 para conferir IDs de ponta a ponta.'
+aws ec2 start-instances --region "$REGIAO" --instance-ids "$EC2_MOTOR" >/dev/null
+LIGOU=1
+aws ec2 wait instance-running --region "$REGIAO" --instance-ids "$EC2_MOTOR"
+SSM=''
+for tentativa in $(seq 1 45); do
+  SSM=$(aws ssm describe-instance-information --region "$REGIAO" \
+    --filters "Key=InstanceIds,Values=$EC2_MOTOR" \
+    --query 'InstanceInformationList[0].PingStatus' --output text)
+  [[ "$SSM" == Online ]] && break
+  sleep 10
+done
+test "$SSM" = Online || { avisar 'SSM ficou offline'; exit 1; }
+
+REMOTO=$(cat <<'SCRIPT_REMOTO'
+#!/bin/bash
+set -Eeuo pipefail
+shutdown -h +20
+RUN='__RUN__'
+BASE="/tmp/tcc2-arroyo-ids-$RUN"
+TOPICO="resultados-arroyo-ids-$RUN"
+CONT="arroyo-ids-$RUN"
+mkdir -p "$BASE"
+test "$(docker inspect -f '{{.State.Running}}' arroyo-tcc)" = false
+KAFKA_ESTADO=$(docker inspect -f '{{.State.Status}}' kafka-tcc)
+[[ "$KAFKA_ESTADO" == exited || "$KAFKA_ESTADO" == running ]]
+if [[ "$KAFKA_ESTADO" == exited ]]; then docker start kafka-tcc >/dev/null; fi
+for tentativa in $(seq 1 60); do
+  if docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh \
+    --bootstrap-server kafka:29092 --list >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:29092 --topic eventos-transporte --time -2 \
+  > "$BASE/offsets_inicio.txt"
+docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:29092 --topic eventos-transporte --time -1 \
+  > "$BASE/offsets_fim.txt"
+INICIO=$(awk -F: '{s+=$3} END{print s+0}' "$BASE/offsets_inicio.txt")
+FIM=$(awk -F: '{s+=$3} END{print s+0}' "$BASE/offsets_fim.txt")
+DISPONIVEL=$(( FIM - INICIO ))
+echo "EVENTOS_KAFKA_DISPONIVEIS=$DISPONIVEL"
+test "$DISPONIVEL" = 610000 || {
+  echo 'Historico incompleto: nao iniciarei a auditoria.'
+  exit 1
+}
+
+SQL="$BASE/arroyosql_auditoria_ids.sql"
+cat > "$SQL" <<'SQL_EOF'
+CREATE TABLE eventos_transporte (
+  id_evento BIGINT,
+  veiculo_id BIGINT,
+  latitude DOUBLE,
+  longitude DOUBLE,
+  velocidade DOUBLE,
+  temperatura_carga DOUBLE,
+  status_rota TEXT,
+  data_hora TEXT
+) WITH (
+  connector = 'kafka',
+  type = 'source',
+  format = 'json',
+  bootstrap_servers = 'kafka:29092',
+  topic = 'eventos-transporte',
+  'source.offset' = 'earliest'
+);
+CREATE TABLE auditoria_saida (
+  id_evento BIGINT
+) WITH (
+  connector = 'kafka',
+  type = 'sink',
+  format = 'json',
+  bootstrap_servers = 'kafka:29092',
+  topic = '__TOPICO__'
+);
+INSERT INTO auditoria_saida SELECT id_evento FROM eventos_transporte;
+SQL_EOF
+sed -i "s/__TOPICO__/$TOPICO/g" "$SQL"
+sha256sum "$SQL" > "$BASE/sha256_sql.txt"
+docker inspect -f '{{.Config.Image}} {{.Image}}' arroyo-tcc > "$BASE/versao_original_arroyo.txt"
+docker exec kafka-tcc /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server kafka:29092 --create --if-not-exists \
+  --topic "$TOPICO" --partitions 3 --replication-factor 1 \
+  > "$BASE/topico_auditoria.txt"
+NET=$(docker inspect kafka-tcc -f '{{range $nome,$config := .NetworkSettings.Networks}}{{$nome}}{{end}}')
+test -n "$NET"
+docker run -d --name "$CONT" --restart no --network "$NET" \
+  --mount "type=bind,src=$SQL,dst=/tmp/auditoria_ids.sql,readonly" \
+  ghcr.io/arroyosystems/arroyo:latest run -p 2 /tmp/auditoria_ids.sql \
+  > "$BASE/container_id.txt"
+echo AUDITORIA_IDS_INICIADA
+
+ULTIMO=0
+for i in $(seq 1 150); do
+  sleep 5
+  if [[ "$(docker inspect -f '{{.State.Running}}' "$CONT")" != true ]]; then
+    echo 'Pipeline encerrou; verificando a quantidade produzida.'
+    break
+  fi
+  ULTIMO=$(docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 2>/dev/null \
+    | awk -F: '{s+=$3} END{print s+0}')
+  if (( i % 12 == 0 )); then echo "SEGUNDOS=$((i*5)) MENSAGENS_SAIDA=$ULTIMO"; fi
+  if (( ULTIMO >= 610000 )); then
+    echo 'MENSAGENS_SAIDA_ATINGIRAM_610000'
+    sleep 20
+    break
+  fi
+done
+docker logs "$CONT" > "$BASE/log_arroyo_ids.txt" 2>&1 || true
+docker inspect -f '{{.State.Status}} {{.State.ExitCode}} {{.Image}}' "$CONT" \
+  > "$BASE/estado_arroyo_ids.txt" || true
+docker exec kafka-tcc /opt/kafka/bin/kafka-get-offsets.sh \
+  --bootstrap-server kafka:29092 --topic "$TOPICO" --time -1 \
+  > "$BASE/offsets_saida.txt"
+
+export BASE TOPICO RUN DISPONIVEL
+/opt/tcc2/venv/bin/python - <<'PY'
+import boto3
+import json
+import os
+import sqlite3
+import subprocess
+from datetime import datetime,timezone
+from pathlib import Path
+
+p=Path(os.environ['BASE'])
+db=sqlite3.connect(str(p/'contagem_ids.sqlite'))
+db.execute('PRAGMA journal_mode=DELETE')
+db.execute('CREATE TABLE origem (id INTEGER PRIMARY KEY, qtd INTEGER NOT NULL)')
+db.execute('CREATE TABLE destino (id INTEGER PRIMARY KEY, qtd INTEGER NOT NULL)')
+
+def ler_topico(nome, tabela):
+    stderr=open(p/f'leitor_{tabela}.log','wb')
+    cmd=['docker','exec','kafka-tcc','/opt/kafka/bin/kafka-console-consumer.sh',
+         '--bootstrap-server','kafka:29092','--topic',nome,
+         '--from-beginning','--timeout-ms','25000']
+    processo=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=stderr)
+    linhas=invalidas=0
+    batch=[]
+    for bruta in processo.stdout:
+        linhas+=1
+        try:
+            obj=json.loads(bruta)
+            numero=int(obj['id_evento'])
+            batch.append((numero,))
+        except (TypeError,ValueError,KeyError,OverflowError):
+            invalidas+=1
+        if len(batch)>=5000:
+            db.executemany(f'INSERT INTO {tabela} (id,qtd) VALUES (?,1) '
+                           'ON CONFLICT(id) DO UPDATE SET qtd=qtd+1',batch)
+            db.commit()
+            batch=[]
+    if batch:
+        db.executemany(f'INSERT INTO {tabela} (id,qtd) VALUES (?,1) '
+                       'ON CONFLICT(id) DO UPDATE SET qtd=qtd+1',batch)
+        db.commit()
+    rc=processo.wait()
+    stderr.close()
+    return {'mensagens':linhas,'invalidas':invalidas,'retorno_leitor':rc}
+
+origem=ler_topico('eventos-transporte','origem')
+destino=ler_topico(os.environ['TOPICO'],'destino')
+faltantes=db.execute('''SELECT COALESCE(SUM(CASE WHEN o.qtd>COALESCE(d.qtd,0)
+ THEN o.qtd-COALESCE(d.qtd,0) ELSE 0 END),0) FROM origem o
+ LEFT JOIN destino d USING(id)''').fetchone()[0]
+extras=db.execute('''SELECT COALESCE(SUM(CASE WHEN d.qtd>COALESCE(o.qtd,0)
+ THEN d.qtd-COALESCE(o.qtd,0) ELSE 0 END),0) FROM destino d
+ LEFT JOIN origem o USING(id)''').fetchone()[0]
+ids_origem=db.execute('SELECT COUNT(*) FROM origem').fetchone()[0]
+ids_destino=db.execute('SELECT COUNT(*) FROM destino').fetchone()[0]
+repeticoes_origem=db.execute('SELECT COALESCE(SUM(qtd-1),0) FROM origem').fetchone()[0]
+repeticoes_destino=db.execute('SELECT COALESCE(SUM(qtd-1),0) FROM destino').fetchone()[0]
+info={
+ 'tipo':'auditoria_arroyo_por_id_com_releitura_kafka',
+ 'utc':datetime.now(timezone.utc).isoformat(),
+ 'entrada':origem,'saida':destino,
+ 'total_esperado':int(os.environ['DISPONIVEL']),
+ 'ids_distintos_origem':ids_origem,'ids_distintos_saida':ids_destino,
+ 'repeticoes_por_id_no_historico_origem':repeticoes_origem,
+ 'repeticoes_por_id_na_saida':repeticoes_destino,
+ 'mensagens_da_origem_ausentes_na_saida_por_id':faltantes,
+ 'mensagens_extras_na_saida_por_id':extras,
+ 'resultado':'CONTAGENS_POR_ID_IDENTICAS' if (
+  origem['mensagens']==destino['mensagens']==int(os.environ['DISPONIVEL'])
+  and origem['invalidas']==destino['invalidas']==0 and faltantes==extras==0
+ ) else 'DIVERGENCIA_DE_IDS_OU_LEITURA',
+ 'ressalva':'Esta auditoria por id usa SQL de passagem; nao valida o calculo TUMBLE nem a latencia do baseline original.',
+}
+(p/'auditoria_ids.json').write_text(json.dumps(info,indent=2,ensure_ascii=False))
+db.close()
+s3=boto3.client('s3',region_name='us-east-1')
+prefixo=f"resultados/validacoes/arroyo_ids/{os.environ['RUN']}/"
+for arquivo in p.iterdir():
+    if arquivo.is_file():
+        s3.upload_file(str(arquivo),'tcc2-pacotes-CONTA_AWS-us-east-1',
+                       prefixo+arquivo.name,ExtraArgs={'ServerSideEncryption':'AES256'})
+print('AUDITORIA_POR_ID:',json.dumps(info,ensure_ascii=False),flush=True)
+print('ARQUIVOS_S3:',prefixo,flush=True)
+PY
+docker stop "$CONT" kafka-tcc >/dev/null 2>&1 || true
+echo AUDITORIA_IDS_ENVIADA_S3
+SCRIPT_REMOTO
+)
+REMOTO="${REMOTO//__RUN__/$RUN}"
+PARAMETROS=$(jq -nc --arg script "$REMOTO" '{commands:[$script],executionTimeout:["1150"]}')
+COMANDO=$(aws ssm send-command --region "$REGIAO" --instance-ids "$EC2_MOTOR" \
+  --document-name AWS-RunShellScript --parameters "$PARAMETROS" \
+  --query Command.CommandId --output text)
+avisar "Comando SSM: $COMANDO"
+STATUS=''
+for tentativa in $(seq 1 225); do
+  STATUS=$(aws ssm get-command-invocation --region "$REGIAO" \
+    --command-id "$COMANDO" --instance-id "$EC2_MOTOR" \
+    --query Status --output text 2>/dev/null || true)
+  case "$STATUS" in Success|Failed|TimedOut|Cancelled|DeliveryTimedOut|Undeliverable) break;; esac
+  sleep 5
+done
+aws ssm get-command-invocation --region "$REGIAO" --command-id "$COMANDO" \
+  --instance-id "$EC2_MOTOR" \
+  --query '{Estado:Status,Saida:StandardOutputContent,Erro:StandardErrorContent}' --output json
+test "$STATUS" = Success
